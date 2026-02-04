@@ -36,6 +36,9 @@ enum CliCommand {
     Llm {
         /// Prompt text (if omitted, read from stdin)
         prompt: Vec<String>,
+        /// Provider profile name (e.g. together)
+        #[arg(long)]
+        provider: Option<String>,
         /// Override model
         #[arg(long)]
         model: Option<String>,
@@ -120,13 +123,23 @@ fn main() -> Result<()> {
         }
         CliCommand::Llm {
             prompt,
+            provider,
             model,
             max_tokens,
             temperature,
             top_p,
             stop,
         } => {
-            run_llm(&cfg, prompt, model, max_tokens, temperature, top_p, stop)?;
+            run_llm(
+                &cfg,
+                prompt,
+                provider,
+                model,
+                max_tokens,
+                temperature,
+                top_p,
+                stop,
+            )?;
         }
         CliCommand::Status => {
             show_status(&cfg)?;
@@ -565,6 +578,7 @@ fn shell_quote(path: &Path) -> String {
 fn run_llm(
     cfg: &Config,
     prompt_parts: Vec<String>,
+    provider: Option<String>,
     model: Option<String>,
     max_tokens: Option<u32>,
     temperature: Option<f32>,
@@ -586,6 +600,9 @@ fn run_llm(
     let mut body = json!({
         "prompt": prompt,
     });
+    if let Some(provider) = provider.clone() {
+        body["provider"] = json!(provider);
+    }
     if let Some(model) = model.clone() {
         body["model"] = json!(model);
     }
@@ -608,6 +625,7 @@ fn run_llm(
         json!({
             "prompt": body["prompt"],
             "model": body.get("model").cloned().unwrap_or(Value::Null),
+            "provider": body.get("provider").cloned().unwrap_or(Value::Null),
         }),
         None,
         None,

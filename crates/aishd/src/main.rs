@@ -5,10 +5,12 @@ use axum::{
     Json, Router,
 };
 use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use clap::Parser;
 use aish_core::config::{self, Config, OpenAICompatConfig};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::env;
 use std::time::Duration;
 use tokio::net::TcpListener;
 
@@ -88,6 +90,7 @@ struct CompletionRequest {
     prompt: Option<String>,
     messages: Option<Vec<ChatMessage>>,
     model: Option<String>,
+    provider: Option<String>,
     max_tokens: Option<u32>,
     temperature: Option<f32>,
     top_p: Option<f32>,
@@ -103,61 +106,71 @@ struct ChatMessage {
 async fn completions(
     State(cfg): State<Config>,
     Json(req): Json<CompletionRequest>,
-) -> impl axum::response::IntoResponse {
-    let provider = match cfg.providers.openai_compat.as_ref() {
-        Some(provider) => provider,
-        None => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error": "openai_compat provider not configured"})),
-            );
+) -> Response {
+    let mut model = req.model.clone().unwrap_or_default();
+    let mut provider_name = req.provider.clone();
+
+    if provider_name.is_none() {
+        if let Some(model_name) = req.model.as_ref() {
+            if let Some(alias) = cfg.providers.model_aliases.get(model_name) {
+                provider_name = Some(alias.provider.clone());
+                model = alias.model.clone();
+            }
         }
+    }
+
+    let provider = match resolve_provider(&cfg, provider_name.as_deref()) {
+        Ok(provider) => provider,
+        Err(resp) => return resp,
     };
 
     if provider.base_url.trim().is_empty() {
         return (
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": "openai_compat.base_url is required"})),
-        );
-    }
-    if provider.api_key.trim().is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": "openai_compat.api_key is required"})),
-        );
+            Json(json!({"error": "provider base_url is required"})),
+        )
+            .into_response();
     }
 
-    let model = req
-        .model
-        .clone()
-        .unwrap_or_else(|| provider.model.clone());
+    if model.trim().is_empty() {
+        model = provider.model.clone();
+    }
     if model.trim().is_empty() {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({"error": "model is required"})),
-        );
+        )
+            .into_response();
     }
 
+    let api_key = match resolve_api_key(provider, provider_name.as_deref()) {
+        Ok(key) => key,
+        Err(resp) => return resp,
+    };
     let provider = provider.clone();
     let result =
-        tokio::task::spawn_blocking(move || call_openai_compat_completions(&provider, &model, &req))
+        tokio::task::spawn_blocking(move || {
+            call_openai_compat_completions(&provider, &api_key, &model, &req)
+        })
     .await;
 
     match result {
-        Ok(Ok(value)) => (StatusCode::OK, Json(value)),
+        Ok(Ok(value)) => (StatusCode::OK, Json(value)).into_response(),
         Ok(Err((status, value))) => {
             let status = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
-            (status, Json(value))
+            (status, Json(value)).into_response()
         }
         Err(err) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": format!("join error: {err}")})),
-        ),
+        )
+            .into_response(),
     }
 }
 
 fn call_openai_compat_completions(
     provider: &OpenAICompatConfig,
+    api_key: &str,
     model: &str,
     req: &CompletionRequest,
 ) -> Result<Value, (u16, Value)> {
@@ -219,7 +232,7 @@ fn call_openai_compat_completions(
         .build();
     let response = agent
         .post(&url)
-        .set("Authorization", &format!("Bearer {}", provider.api_key))
+        .set("Authorization", &format!("Bearer {}", api_key))
         .set("Content-Type", "application/json")
         .send_string(&body.to_string());
 
@@ -236,4 +249,80 @@ fn call_openai_compat_completions(
         }
         Err(err) => Err((502, json!({ "error": err.to_string() }))),
     }
+}
+
+fn resolve_provider<'a>(
+    cfg: &'a Config,
+    provider_name: Option<&str>,
+) -> Result<&'a OpenAICompatConfig, Response> {
+    if let Some(name) = provider_name {
+        if name == "default" {
+            return cfg
+                .providers
+                .openai_compat
+                .as_ref()
+                .ok_or_else(|| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({"error": "default provider not configured"})),
+                    )
+                        .into_response()
+                });
+        }
+        return cfg
+            .providers
+            .openai_compat_profiles
+            .get(name)
+            .ok_or_else(|| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": format!("provider '{name}' not found")})),
+                )
+                    .into_response()
+            });
+    }
+
+    cfg.providers
+        .openai_compat
+        .as_ref()
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "openai_compat provider not configured"})),
+            )
+                .into_response()
+        })
+}
+
+fn resolve_api_key(
+    provider: &OpenAICompatConfig,
+    provider_name: Option<&str>,
+) -> Result<String, Response> {
+    if !provider.api_key.trim().is_empty() {
+        return Ok(provider.api_key.clone());
+    }
+    if let Some(env_key) = provider.api_key_env.as_deref() {
+        if let Ok(value) = env::var(env_key) {
+            if !value.trim().is_empty() {
+                return Ok(value);
+            }
+        }
+    }
+
+    let fallback_env = provider_name
+        .map(|name| format!("{}_API_KEY", name.to_uppercase()))
+        .unwrap_or_default();
+    if !fallback_env.is_empty() {
+        if let Ok(value) = env::var(&fallback_env) {
+            if !value.trim().is_empty() {
+                return Ok(value);
+            }
+        }
+    }
+
+    Err((
+        StatusCode::BAD_REQUEST,
+        Json(json!({"error": "api key not configured"})),
+    )
+        .into_response())
 }

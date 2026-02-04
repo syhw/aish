@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -78,11 +79,17 @@ impl Default for LoggingConfig {
 #[serde(default)]
 pub struct ProvidersConfig {
     pub openai_compat: Option<OpenAICompatConfig>,
+    pub openai_compat_profiles: BTreeMap<String, OpenAICompatConfig>,
+    pub model_aliases: BTreeMap<String, ModelAlias>,
 }
 
 impl Default for ProvidersConfig {
     fn default() -> Self {
-        Self { openai_compat: None }
+        Self {
+            openai_compat: None,
+            openai_compat_profiles: BTreeMap::new(),
+            model_aliases: BTreeMap::new(),
+        }
     }
 }
 
@@ -93,6 +100,7 @@ pub struct OpenAICompatConfig {
     pub api_key: String,
     pub model: String,
     pub completions_path: String,
+    pub api_key_env: Option<String>,
 }
 
 impl Default for OpenAICompatConfig {
@@ -102,6 +110,23 @@ impl Default for OpenAICompatConfig {
             api_key: String::new(),
             model: "glm-4.7".to_string(),
             completions_path: "/completions".to_string(),
+            api_key_env: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ModelAlias {
+    pub provider: String,
+    pub model: String,
+}
+
+impl Default for ModelAlias {
+    fn default() -> Self {
+        Self {
+            provider: String::new(),
+            model: String::new(),
         }
     }
 }
@@ -150,12 +175,11 @@ fn resolve_path(path: &Path) -> PathBuf {
 }
 
 fn apply_env_overrides(cfg: &mut Config) {
-    let base_url = env::var("AISH_OPENAI_COMPAT_BASE_URL").ok();
-    let api_key = env::var("AISH_OPENAI_COMPAT_API_KEY")
-        .ok()
-        .or_else(|| env::var("ZAI_API_KEY").ok());
-    let model = env::var("AISH_OPENAI_COMPAT_MODEL").ok();
-    let completions_path = env::var("AISH_OPENAI_COMPAT_COMPLETIONS_PATH").ok();
+    let base_url = env_nonempty("AISH_OPENAI_COMPAT_BASE_URL");
+    let api_key = env_nonempty("AISH_OPENAI_COMPAT_API_KEY")
+        .or_else(|| env_nonempty("ZAI_API_KEY"));
+    let model = env_nonempty("AISH_OPENAI_COMPAT_MODEL");
+    let completions_path = env_nonempty("AISH_OPENAI_COMPAT_COMPLETIONS_PATH");
 
     if base_url.is_some() || api_key.is_some() || model.is_some() || completions_path.is_some() {
         let provider = cfg
@@ -174,6 +198,13 @@ fn apply_env_overrides(cfg: &mut Config) {
         if let Some(value) = completions_path {
             provider.completions_path = value;
         }
+    }
+}
+
+fn env_nonempty(key: &str) -> Option<String> {
+    match env::var(key) {
+        Ok(value) if !value.trim().is_empty() => Some(value),
+        _ => None,
     }
 }
 
@@ -228,6 +259,24 @@ mod tests {
 
         let provider = cfg.providers.openai_compat.expect("provider missing");
         assert_eq!(provider.api_key, "aish-key");
+
+        std::env::remove_var("ZAI_API_KEY");
+        std::env::remove_var("AISH_OPENAI_COMPAT_API_KEY");
+    }
+
+    #[test]
+    fn empty_aish_api_key_falls_back_to_zai_api_key() {
+        let _guard = env_lock().lock().unwrap();
+        std::env::set_var("ZAI_API_KEY", "zai-key");
+        std::env::set_var("AISH_OPENAI_COMPAT_API_KEY", "");
+
+        let path = temp_config_path("empty_aish_key");
+        fs::write(&path, "{}").unwrap();
+        let cfg = load(&path).unwrap();
+        fs::remove_file(&path).ok();
+
+        let provider = cfg.providers.openai_compat.expect("provider missing");
+        assert_eq!(provider.api_key, "zai-key");
 
         std::env::remove_var("ZAI_API_KEY");
         std::env::remove_var("AISH_OPENAI_COMPAT_API_KEY");
