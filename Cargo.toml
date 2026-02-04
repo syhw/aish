@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/aish",
+  "crates/aishd",
+  "crates/aish_core",
+]
+
+[workspace.package]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+anyhow = "1"
+axum = "0.7"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+ureq = "2"
