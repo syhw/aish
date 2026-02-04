@@ -13,4 +13,5 @@ tracing-subscriber = { workspace = true }
 axum = { workspace = true }
 tokio = { workspace = true }
 ureq = { workspace = true }
+chrono = { workspace = true }
 aish_core = { path = "../aish_core" }

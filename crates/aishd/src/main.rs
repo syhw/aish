@@ -1,7 +1,7 @@
 use anyhow::{bail, Result};
 use axum::{
-    extract::State,
     extract::Path as AxumPath,
+    extract::State,
     routing::{get, post},
     Json, Router,
 };
@@ -17,6 +17,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::net::TcpListener;
+use chrono::Utc;
 
 #[derive(Parser)]
 #[command(name = "aishd", version, about = "aish server daemon")]
@@ -43,13 +44,24 @@ async fn main() -> Result<()> {
     let listener = TcpListener::bind(&addr).await?;
     println!("aishd listening on http://{addr}");
 
+    let store_path = resolve_path(&cfg.logging.dir).join("sessions.jsonl");
+    let store = load_store(&store_path).unwrap_or_default();
+    let state = AppState {
+        cfg,
+        store: std::sync::Arc::new(std::sync::Mutex::new(store)),
+        store_path,
+    };
+
     let app = Router::new()
         .route("/health", get(health))
         .route("/version", get(version))
         .route("/v1/completions", post(completions))
+        .route("/v1/sessions", get(list_sessions).post(create_session))
+        .route("/v1/sessions/:id", get(get_session).patch(patch_session))
+        .route("/v1/sessions/:id/agents", get(list_agents).post(create_agent))
         .route("/v1/tools", get(list_tools))
         .route("/v1/tools/:name/call", post(call_tool))
-        .with_state(cfg);
+        .with_state(state);
 
     axum::serve(listener, app).await?;
     Ok(())
@@ -132,10 +144,18 @@ struct ToolCallResponse {
     duration_ms: u128,
 }
 
+#[derive(Clone)]
+struct AppState {
+    cfg: Config,
+    store: std::sync::Arc<std::sync::Mutex<Store>>,
+    store_path: PathBuf,
+}
+
 async fn completions(
-    State(cfg): State<Config>,
+    State(state): State<AppState>,
     Json(req): Json<CompletionRequest>,
 ) -> Response {
+    let cfg = &state.cfg;
     let mut model = req.model.clone().unwrap_or_default();
     let mut provider_name = req.provider.clone();
 
@@ -197,7 +217,8 @@ async fn completions(
     }
 }
 
-async fn list_tools(State(cfg): State<Config>) -> impl IntoResponse {
+async fn list_tools(State(state): State<AppState>) -> impl IntoResponse {
+    let cfg = &state.cfg;
     let infos = tool_defs()
         .into_iter()
         .map(|def| ToolInfo {
@@ -211,10 +232,11 @@ async fn list_tools(State(cfg): State<Config>) -> impl IntoResponse {
 }
 
 async fn call_tool(
-    State(cfg): State<Config>,
+    State(state): State<AppState>,
     AxumPath(name): AxumPath<String>,
     Json(req): Json<ToolCallRequest>,
 ) -> Response {
+    let cfg = &state.cfg;
     let def = match tool_defs().into_iter().find(|d| d.name == name) {
         Some(def) => def,
         None => {
@@ -313,6 +335,170 @@ async fn call_tool(
             (status, Json(err)).into_response()
         }
     }
+}
+
+async fn list_sessions(State(state): State<AppState>) -> impl IntoResponse {
+    let store = state.store.lock().unwrap();
+    let sessions = store.sessions.values().cloned().collect::<Vec<_>>();
+    (StatusCode::OK, Json(sessions))
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateSessionRequest {
+    title: Option<String>,
+    share_state: Option<String>,
+}
+
+async fn create_session(
+    State(state): State<AppState>,
+    Json(req): Json<CreateSessionRequest>,
+) -> Response {
+    let mut store = state.store.lock().unwrap();
+    let id = store.next_id("sess");
+    let now = now_ms();
+    let session = Session {
+        id: id.clone(),
+        title: req.title.unwrap_or_else(|| "untitled".to_string()),
+        created_at: now,
+        updated_at: now,
+        status: "idle".to_string(),
+        share_state: req.share_state.unwrap_or_else(|| "manual".to_string()),
+        tmux_session_name: None,
+    };
+    store.sessions.insert(id.clone(), session.clone());
+    if let Err(err) = append_store_event(
+        &state.store_path,
+        StoreEvent::SessionUpsert(session.clone()),
+    ) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": err.to_string()})),
+        )
+            .into_response();
+    }
+    (StatusCode::OK, Json(session)).into_response()
+}
+
+async fn get_session(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    let store = state.store.lock().unwrap();
+    match store.sessions.get(&id) {
+        Some(session) => (StatusCode::OK, Json(session)).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "session not found"})),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct PatchSessionRequest {
+    title: Option<String>,
+    share_state: Option<String>,
+    status: Option<String>,
+}
+
+async fn patch_session(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Json(req): Json<PatchSessionRequest>,
+) -> Response {
+    let mut store = state.store.lock().unwrap();
+    let session = match store.sessions.get_mut(&id) {
+        Some(session) => session,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "session not found"})),
+            )
+                .into_response();
+        }
+    };
+    if let Some(title) = req.title {
+        session.title = title;
+    }
+    if let Some(share_state) = req.share_state {
+        session.share_state = share_state;
+    }
+    if let Some(status) = req.status {
+        session.status = status;
+    }
+    session.updated_at = now_ms();
+    let updated = session.clone();
+    if let Err(err) = append_store_event(&state.store_path, StoreEvent::SessionUpsert(updated.clone())) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": err.to_string()})),
+        )
+            .into_response();
+    }
+    (StatusCode::OK, Json(updated)).into_response()
+}
+
+async fn list_agents(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    let store = state.store.lock().unwrap();
+    let agents = store
+        .agents
+        .values()
+        .filter(|agent| agent.session_id == id)
+        .cloned()
+        .collect::<Vec<_>>();
+    (StatusCode::OK, Json(agents)).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateAgentRequest {
+    parent_agent_id: Option<String>,
+    model: Option<String>,
+}
+
+async fn create_agent(
+    State(state): State<AppState>,
+    AxumPath(session_id): AxumPath<String>,
+    Json(req): Json<CreateAgentRequest>,
+) -> Response {
+    let mut store = state.store.lock().unwrap();
+    if !store.sessions.contains_key(&session_id) {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "session not found"})),
+        )
+            .into_response();
+    }
+    let id = store.next_id("agent");
+    let tmux_name = format!("{}-{}-{}", state.cfg.tmux.session_prefix, session_id, id);
+    if let Err(err) = spawn_tmux_session(&tmux_name) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": err.to_string()})),
+        )
+            .into_response();
+    }
+
+    let agent = Agent {
+        id: id.clone(),
+        session_id: session_id.clone(),
+        parent_agent_id: req.parent_agent_id,
+        model: req.model,
+        status: "idle".to_string(),
+        tmux_session_name: Some(tmux_name),
+        worktree: None,
+    };
+    store.agents.insert(id.clone(), agent.clone());
+    if let Err(err) = append_store_event(&state.store_path, StoreEvent::AgentUpsert(agent.clone())) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": err.to_string()})),
+        )
+            .into_response();
+    }
+    (StatusCode::OK, Json(agent)).into_response()
 }
 
 fn call_openai_compat_completions(
@@ -691,6 +877,32 @@ mod tests {
         assert_eq!(shell, "/bin/sh");
         assert_eq!(args, vec!["-c".to_string()]);
     }
+
+    #[test]
+    fn next_id_is_human_readable() {
+        let mut store = Store::default();
+        let id = store.next_id("sess");
+        let parts: Vec<&str> = id.split('_').collect();
+        assert_eq!(parts.len(), 4);
+        assert_eq!(parts[0], "sess");
+        assert_eq!(parts[1].len(), 8);
+        assert!(parts[1].chars().all(|c| c.is_ascii_digit()));
+        assert_eq!(parts[2].len(), 6);
+        assert!(parts[2].chars().all(|c| c.is_ascii_digit()));
+        assert_eq!(parts[3].len(), 3);
+        assert!(parts[3].chars().all(|c| c.is_ascii_digit()));
+    }
+
+    #[test]
+    fn update_seq_from_id_tracks_suffix() {
+        let mut store = Store::default();
+        store.update_seq_from_id("sess_20260204_010203_042");
+        assert_eq!(store.seq, 42);
+        store.update_seq_from_id("agent_20260204_010203_007");
+        assert_eq!(store.seq, 42);
+        store.update_seq_from_id("sess_20260204_010203_100");
+        assert_eq!(store.seq, 100);
+    }
 }
 
 fn run_fs_read(args: Value) -> Result<Value, (StatusCode, Value)> {
@@ -820,4 +1032,111 @@ fn now_ms() -> u128 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_else(|_| Duration::from_secs(0))
         .as_millis()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Session {
+    id: String,
+    title: String,
+    created_at: u128,
+    updated_at: u128,
+    status: String,
+    share_state: String,
+    tmux_session_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Agent {
+    id: String,
+    session_id: String,
+    parent_agent_id: Option<String>,
+    model: Option<String>,
+    status: String,
+    tmux_session_name: Option<String>,
+    worktree: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct Store {
+    sessions: BTreeMap<String, Session>,
+    agents: BTreeMap<String, Agent>,
+    seq: u64,
+}
+
+impl Store {
+    fn next_id(&mut self, prefix: &str) -> String {
+        self.seq += 1;
+        let stamp = Utc::now().format("%Y%m%d_%H%M%S");
+        format!("{prefix}_{stamp}_{:03}", self.seq)
+    }
+
+    fn update_seq_from_id(&mut self, id: &str) {
+        if let Some(last) = id.rsplit('_').next() {
+            if let Ok(value) = last.parse::<u64>() {
+                if value > self.seq {
+                    self.seq = value;
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "type", content = "data")]
+enum StoreEvent {
+    #[serde(rename = "session.upsert")]
+    SessionUpsert(Session),
+    #[serde(rename = "agent.upsert")]
+    AgentUpsert(Agent),
+}
+
+fn load_store(path: &Path) -> Result<Store, std::io::Error> {
+    if !path.exists() {
+        return Ok(Store::default());
+    }
+    let content = fs::read_to_string(path)?;
+    let mut store = Store::default();
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Ok(event) = serde_json::from_str::<StoreEvent>(line) {
+            apply_event(&mut store, event);
+        }
+    }
+    Ok(store)
+}
+
+fn apply_event(store: &mut Store, event: StoreEvent) {
+    match event {
+        StoreEvent::SessionUpsert(session) => {
+            store.update_seq_from_id(&session.id);
+            store.sessions.insert(session.id.clone(), session);
+        }
+        StoreEvent::AgentUpsert(agent) => {
+            store.update_seq_from_id(&agent.id);
+            store.agents.insert(agent.id.clone(), agent);
+        }
+    }
+}
+
+fn append_store_event(path: &Path, event: StoreEvent) -> Result<(), std::io::Error> {
+    append_jsonl(path, &serde_json::to_value(event).unwrap_or_else(|_| json!({})))
+}
+
+fn spawn_tmux_session(name: &str) -> Result<(), std::io::Error> {
+    let status = std::process::Command::new("tmux")
+        .arg("new-session")
+        .arg("-d")
+        .arg("-s")
+        .arg(name)
+        .status()?;
+    if !status.success() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("tmux exited with status: {status}"),
+        ));
+    }
+    Ok(())
 }
