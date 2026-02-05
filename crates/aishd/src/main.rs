@@ -60,6 +60,7 @@ async fn main() -> Result<()> {
         .route("/v1/sessions/:id", get(get_session).patch(patch_session))
         .route("/v1/sessions/:id/agents", get(list_agents).post(create_agent))
         .route("/v1/agents/:id/run", post(run_agent))
+        .route("/v1/diagnostics/tmux", get(diagnostics_tmux))
         .route("/v1/tools", get(list_tools))
         .route("/v1/tools/:name/call", post(call_tool))
         .with_state(state);
@@ -150,6 +151,19 @@ struct AppState {
     cfg: Config,
     store: std::sync::Arc<std::sync::Mutex<Store>>,
     store_path: PathBuf,
+}
+
+#[derive(Debug, Serialize)]
+struct DiagnosticStep {
+    name: &'static str,
+    ok: bool,
+    detail: String,
+}
+
+#[derive(Debug, Serialize)]
+struct DiagnosticReport {
+    ok: bool,
+    steps: Vec<DiagnosticStep>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -670,6 +684,83 @@ async fn run_agent(
         .into_response()
 }
 
+async fn diagnostics_tmux() -> Response {
+    let mut steps = Vec::new();
+    let mut ok = true;
+
+    match run_command_output("tmux", &["-V"]) {
+        Ok(output) => steps.push(DiagnosticStep {
+            name: "version",
+            ok: true,
+            detail: output.trim().to_string(),
+        }),
+        Err(err) => {
+            steps.push(DiagnosticStep {
+                name: "version",
+                ok: false,
+                detail: err,
+            });
+            ok = false;
+        }
+    }
+
+    let session_name = format!("aish-diag-{}", now_ms());
+    if ok {
+        match run_command_status("tmux", &["new-session", "-d", "-s", &session_name]) {
+            Ok(()) => steps.push(DiagnosticStep {
+                name: "create_session",
+                ok: true,
+                detail: session_name.clone(),
+            }),
+            Err(err) => {
+                steps.push(DiagnosticStep {
+                    name: "create_session",
+                    ok: false,
+                    detail: err,
+                });
+                ok = false;
+            }
+        }
+    }
+
+    if ok {
+        match run_command_output("tmux", &["list-sessions"]) {
+            Ok(output) => {
+                let found = output.lines().any(|line| line.contains(&session_name));
+                steps.push(DiagnosticStep {
+                    name: "list_sessions",
+                    ok: found,
+                    detail: output.trim().to_string(),
+                });
+                if !found {
+                    ok = false;
+                }
+            }
+            Err(err) => {
+                steps.push(DiagnosticStep {
+                    name: "list_sessions",
+                    ok: false,
+                    detail: err,
+                });
+                ok = false;
+            }
+        }
+    }
+
+    let kill_result = run_command_status("tmux", &["kill-session", "-t", &session_name]);
+    steps.push(DiagnosticStep {
+        name: "cleanup",
+        ok: kill_result.is_ok(),
+        detail: kill_result.err().unwrap_or_else(|| "ok".to_string()),
+    });
+
+    (
+        StatusCode::OK,
+        Json(DiagnosticReport { ok, steps }),
+    )
+        .into_response()
+}
+
 fn call_openai_compat_completions(
     provider: &OpenAICompatConfig,
     api_key: &str,
@@ -1047,6 +1138,29 @@ fn set_agent_status(state: &AppState, agent_id: &str, status: &str) {
         agent.worktree = agent.worktree.clone();
         let updated = agent.clone();
         let _ = append_store_event(&state.store_path, StoreEvent::AgentUpsert(updated));
+    }
+}
+
+fn run_command_output(cmd: &str, args: &[&str]) -> Result<String, String> {
+    let output = std::process::Command::new(cmd)
+        .args(args)
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).to_string());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+fn run_command_status(cmd: &str, args: &[&str]) -> Result<(), String> {
+    let status = std::process::Command::new(cmd)
+        .args(args)
+        .status()
+        .map_err(|e| e.to_string())?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("exit status: {status}"))
     }
 }
 
