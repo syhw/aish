@@ -59,6 +59,7 @@ async fn main() -> Result<()> {
         .route("/v1/sessions", get(list_sessions).post(create_session))
         .route("/v1/sessions/:id", get(get_session).patch(patch_session))
         .route("/v1/sessions/:id/agents", get(list_agents).post(create_agent))
+        .route("/v1/agents/:id/run", post(run_agent))
         .route("/v1/tools", get(list_tools))
         .route("/v1/tools/:name/call", post(call_tool))
         .with_state(state);
@@ -149,6 +150,31 @@ struct AppState {
     cfg: Config,
     store: std::sync::Arc<std::sync::Mutex<Store>>,
     store_path: PathBuf,
+}
+
+#[derive(Debug, Deserialize)]
+struct RunAgentRequest {
+    prompt: String,
+    provider: Option<String>,
+    model: Option<String>,
+    max_steps: Option<u32>,
+    tools: Option<Vec<String>>,
+    approved: Option<bool>,
+    approval_reason: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct RunAgentResponse {
+    status: String,
+    output: Option<String>,
+    steps: u32,
+    pending_tool_call: Option<ToolCall>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct ToolCall {
+    tool: String,
+    args: Value,
 }
 
 async fn completions(
@@ -501,6 +527,149 @@ async fn create_agent(
     (StatusCode::OK, Json(agent)).into_response()
 }
 
+async fn run_agent(
+    State(state): State<AppState>,
+    AxumPath(agent_id): AxumPath<String>,
+    Json(req): Json<RunAgentRequest>,
+) -> Response {
+    let (session_id, model_default) = {
+        let mut store = state.store.lock().unwrap();
+        let agent = match store.agents.get_mut(&agent_id) {
+            Some(agent) => agent,
+            None => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({"error": "agent not found"})),
+                )
+                    .into_response();
+            }
+        };
+        agent.status = "running".to_string();
+        let updated = agent.clone();
+        if let Err(err) =
+            append_store_event(&state.store_path, StoreEvent::AgentUpsert(updated.clone()))
+        {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": err.to_string()})),
+            )
+                .into_response();
+        }
+        (agent.session_id.clone(), agent.model.clone())
+    };
+
+    let max_steps = req.max_steps.unwrap_or(8);
+    let mut messages = Vec::new();
+    messages.push(ChatMessage {
+        role: "system".to_string(),
+        content: tool_system_prompt(),
+    });
+    messages.push(ChatMessage {
+        role: "user".to_string(),
+        content: req.prompt.clone(),
+    });
+
+    let mut steps = 0u32;
+    let mut output: Option<String> = None;
+    let mut pending: Option<ToolCall> = None;
+
+    while steps < max_steps {
+        steps += 1;
+        let completion = match call_llm_with_messages(
+            &state.cfg,
+            req.provider.clone(),
+            req.model.clone().or(model_default.clone()),
+            &messages,
+        ) {
+            Ok(text) => text,
+            Err(err) => {
+                set_agent_status(&state, &agent_id, "error");
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({"error": err})),
+                )
+                    .into_response();
+            }
+        };
+
+        messages.push(ChatMessage {
+            role: "assistant".to_string(),
+            content: completion.clone(),
+        });
+
+        let tool_calls = parse_tool_calls(&completion);
+        if tool_calls.is_empty() {
+            output = Some(completion);
+            break;
+        }
+
+        for call in tool_calls {
+            if let Some(allowed) = &req.tools {
+                if !allowed.iter().any(|name| name == &call.tool) {
+                    set_agent_status(&state, &agent_id, "error");
+                    return (
+                        StatusCode::FORBIDDEN,
+                        Json(json!({"error": "tool not allowed", "tool": call.tool})),
+                    )
+                        .into_response();
+                }
+            }
+
+            match execute_tool(
+                &state.cfg,
+                &call.tool,
+                call.args.clone(),
+                Some(&session_id),
+                Some(&agent_id),
+                req.approved == Some(true),
+                req.approval_reason.clone(),
+            ) {
+                Ok(result) => {
+                    messages.push(ChatMessage {
+                        role: "user".to_string(),
+                        content: format!("Tool result for {}:\n{}", call.tool, result),
+                    });
+                }
+                Err(ToolExecError::ApprovalRequired) => {
+                    pending = Some(call);
+                    break;
+                }
+                Err(ToolExecError::Failed(status, err)) => {
+                    set_agent_status(&state, &agent_id, "error");
+                    return (status, Json(err)).into_response();
+                }
+            }
+        }
+
+        if pending.is_some() {
+            break;
+        }
+    }
+
+    set_agent_status(&state, &agent_id, "idle");
+
+    if let Some(pending) = pending {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(RunAgentResponse {
+                status: "approval_required".to_string(),
+                output: output.clone(),
+                steps,
+                pending_tool_call: Some(pending),
+            }),
+        )
+            .into_response();
+    }
+
+    (StatusCode::OK, Json(RunAgentResponse {
+        status: "completed".to_string(),
+        output,
+        steps,
+        pending_tool_call: None,
+    }))
+        .into_response()
+}
+
 fn call_openai_compat_completions(
     provider: &OpenAICompatConfig,
     api_key: &str,
@@ -658,6 +827,227 @@ fn resolve_api_key(
         Json(json!({"error": "api key not configured"})),
     )
         .into_response())
+}
+
+fn call_llm_with_messages(
+    cfg: &Config,
+    provider_name: Option<String>,
+    model: Option<String>,
+    messages: &[ChatMessage],
+) -> Result<String, String> {
+    let provider_name_ref = provider_name.as_deref();
+    let provider = resolve_provider(cfg, provider_name_ref)
+        .map_err(|_| "provider not configured".to_string())?;
+    if provider.base_url.trim().is_empty() {
+        return Err("provider base_url is required".to_string());
+    }
+    let model = model.unwrap_or_else(|| provider.model.clone());
+    if model.trim().is_empty() {
+        return Err("model is required".to_string());
+    }
+    let api_key = resolve_api_key(provider, provider_name_ref)
+        .map_err(|_| "api key not configured".to_string())?;
+
+    let req = CompletionRequest {
+        prompt: None,
+        messages: Some(messages.to_vec()),
+        model: Some(model.clone()),
+        provider: provider_name,
+        max_tokens: None,
+        temperature: None,
+        top_p: None,
+        stop: None,
+    };
+    let response = call_openai_compat_completions(provider, &api_key, &model, &req)
+        .map_err(|(_, err)| err.to_string())?;
+    extract_completion_text(&response)
+        .ok_or_else(|| "no completion text returned".to_string())
+}
+
+fn extract_completion_text(value: &Value) -> Option<String> {
+    let choices = value.get("choices")?.as_array()?;
+    let first = choices.first()?;
+    if let Some(text) = first.get("text").and_then(|v| v.as_str()) {
+        return Some(text.to_string());
+    }
+    if let Some(message) = first.get("message") {
+        if let Some(content) = message.get("content").and_then(|v| v.as_str()) {
+            return Some(content.to_string());
+        }
+    }
+    None
+}
+
+fn tool_system_prompt() -> String {
+    [
+        "You are a tool-using assistant.",
+        "When you need a tool, reply with ONLY valid JSON.",
+        "Formats:",
+        "  {\"tool\":\"shell\",\"args\":{\"cmd\":\"ls\"}}",
+        "  {\"tool_calls\":[{\"tool\":\"fs.read\",\"args\":{\"path\":\"README.md\"}}]}",
+        "If no tool is needed, reply with a normal answer.",
+    ]
+    .join("\n")
+}
+
+fn parse_tool_calls(text: &str) -> Vec<ToolCall> {
+    let json = match extract_json_value(text) {
+        Some(value) => value,
+        None => return Vec::new(),
+    };
+    tool_calls_from_value(&json)
+}
+
+fn extract_json_value(text: &str) -> Option<Value> {
+    let trimmed = text.trim();
+    if trimmed.starts_with("```") {
+        if let Some(start) = trimmed.find("```") {
+            if let Some(end) = trimmed.rfind("```") {
+                if end > start + 3 {
+                    let inner = &trimmed[start + 3..end];
+                    let inner = inner.trim_start_matches("json").trim();
+                    return serde_json::from_str(inner).ok();
+                }
+            }
+        }
+    }
+    if trimmed.starts_with('{') || trimmed.starts_with('[') {
+        serde_json::from_str(trimmed).ok()
+    } else {
+        None
+    }
+}
+
+fn tool_calls_from_value(value: &Value) -> Vec<ToolCall> {
+    if let Some(obj) = value.as_object() {
+        if let Some(tool) = obj.get("tool").and_then(|v| v.as_str()) {
+            let args = obj.get("args").cloned().unwrap_or(Value::Null);
+            return vec![ToolCall {
+                tool: tool.to_string(),
+                args,
+            }];
+        }
+        if let Some(calls) = obj.get("tool_calls").and_then(|v| v.as_array()) {
+            return calls
+                .iter()
+                .filter_map(|item| {
+                    let tool = item.get("tool").or_else(|| item.get("name"))?;
+                    let tool = tool.as_str()?;
+                    let args = item.get("args").cloned().unwrap_or(Value::Null);
+                    Some(ToolCall {
+                        tool: tool.to_string(),
+                        args,
+                    })
+                })
+                .collect();
+        }
+    }
+    if let Some(arr) = value.as_array() {
+        return arr
+            .iter()
+            .filter_map(|item| {
+                let tool = item.get("tool").or_else(|| item.get("name"))?;
+                let tool = tool.as_str()?;
+                let args = item.get("args").cloned().unwrap_or(Value::Null);
+                Some(ToolCall {
+                    tool: tool.to_string(),
+                    args,
+                })
+            })
+            .collect();
+    }
+    Vec::new()
+}
+
+enum ToolExecError {
+    ApprovalRequired,
+    Failed(StatusCode, Value),
+}
+
+fn execute_tool(
+    cfg: &Config,
+    name: &str,
+    args: Value,
+    session_id: Option<&str>,
+    agent_id: Option<&str>,
+    approved: bool,
+    approval_reason: Option<String>,
+) -> Result<Value, ToolExecError> {
+    let policy = policy_for(cfg, name);
+    match policy {
+        ToolPolicy::Deny => {
+            return Err(ToolExecError::Failed(
+                StatusCode::FORBIDDEN,
+                json!({"error": "tool denied", "tool": name}),
+            ));
+        }
+        ToolPolicy::Ask => {
+            if !approved {
+                return Err(ToolExecError::ApprovalRequired);
+            }
+        }
+        ToolPolicy::Allow => {}
+    }
+
+    let _ = log_tool_event(
+        cfg,
+        session_id,
+        agent_id,
+        "tool.start",
+        json!({
+            "tool": name,
+            "args": args,
+            "approval_reason": approval_reason,
+        }),
+    );
+
+    let result = match name {
+        "shell" => run_shell(args),
+        "fs.read" => run_fs_read(args),
+        "fs.write" => run_fs_write(args),
+        "fs.list" => run_fs_list(args),
+        _ => Err((StatusCode::NOT_FOUND, json!({"error": "unknown tool"}))),
+    };
+
+    match result {
+        Ok(value) => {
+            let _ = log_tool_event(
+                cfg,
+                session_id,
+                agent_id,
+                "tool.end",
+                json!({
+                    "tool": name,
+                    "ok": true,
+                }),
+            );
+            Ok(value)
+        }
+        Err((status, err)) => {
+            let _ = log_tool_event(
+                cfg,
+                session_id,
+                agent_id,
+                "tool.end",
+                json!({
+                    "tool": name,
+                    "ok": false,
+                    "error": err,
+                }),
+            );
+            Err(ToolExecError::Failed(status, err))
+        }
+    }
+}
+
+fn set_agent_status(state: &AppState, agent_id: &str, status: &str) {
+    let mut store = state.store.lock().unwrap();
+    if let Some(agent) = store.agents.get_mut(agent_id) {
+        agent.status = status.to_string();
+        agent.worktree = agent.worktree.clone();
+        let updated = agent.clone();
+        let _ = append_store_event(&state.store_path, StoreEvent::AgentUpsert(updated));
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -902,6 +1292,30 @@ mod tests {
         assert_eq!(store.seq, 42);
         store.update_seq_from_id("sess_20260204_010203_100");
         assert_eq!(store.seq, 100);
+    }
+
+    #[test]
+    fn parse_tool_calls_single() {
+        let text = r#"{"tool":"shell","args":{"cmd":"ls"}}"#;
+        let calls = parse_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].tool, "shell");
+        assert_eq!(calls[0].args["cmd"], "ls");
+    }
+
+    #[test]
+    fn parse_tool_calls_array() {
+        let text = r#"{"tool_calls":[{"tool":"fs.read","args":{"path":"README.md"}}]}"#;
+        let calls = parse_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].tool, "fs.read");
+        assert_eq!(calls[0].args["path"], "README.md");
+    }
+
+    #[test]
+    fn parse_tool_calls_non_json() {
+        let calls = parse_tool_calls("hello there");
+        assert!(calls.is_empty());
     }
 }
 
