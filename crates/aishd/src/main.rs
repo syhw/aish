@@ -61,6 +61,7 @@ async fn main() -> Result<()> {
         .route("/v1/sessions/:id/agents", get(list_agents).post(create_agent))
         .route("/v1/agents/:id/run", post(run_agent))
         .route("/v1/agents/:id/subagents", post(subagents))
+        .route("/v1/agents/:id/flow", post(run_flow))
         .route("/v1/diagnostics/tmux", get(diagnostics_tmux))
         .route("/v1/tools", get(list_tools))
         .route("/v1/tools/:name/call", post(call_tool))
@@ -620,6 +621,8 @@ struct SubagentRequest {
     mode: Option<String>,
     max_concurrency: Option<u32>,
     approved_tools: Option<Vec<String>>,
+    aggregate: Option<bool>,
+    aggregate_prompt: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -640,12 +643,52 @@ struct SubagentResult {
     error: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+struct SubagentsResponse {
+    results: Vec<SubagentResult>,
+    summary: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FlowRequest {
+    nodes: Vec<FlowNode>,
+    edges: Vec<FlowEdge>,
+    provider: Option<String>,
+    model: Option<String>,
+    max_concurrency: Option<u32>,
+    tools: Option<Vec<String>>,
+    approved_tools: Option<Vec<String>>,
+    approved: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct FlowNode {
+    id: String,
+    kind: String,
+    prompt: Option<String>,
+    tool: Option<String>,
+    args: Option<Value>,
+    inputs: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct FlowEdge {
+    from: String,
+    to: String,
+}
+
+#[derive(Debug, Serialize)]
+struct FlowResponse {
+    status: String,
+    outputs: BTreeMap<String, Value>,
+}
+
 async fn subagents(
     State(state): State<AppState>,
     AxumPath(agent_id): AxumPath<String>,
     Json(req): Json<SubagentRequest>,
 ) -> Response {
-    let (session_id, has_parent) = {
+    let (session_id, has_parent, lead_model, lead_provider) = {
         let store = state.store.lock().unwrap();
         let agent = match store.agents.get(&agent_id) {
             Some(agent) => agent,
@@ -657,7 +700,12 @@ async fn subagents(
                     .into_response();
             }
         };
-        (agent.session_id.clone(), agent.parent_agent_id.is_some())
+        (
+            agent.session_id.clone(),
+            agent.parent_agent_id.is_some(),
+            agent.model.clone(),
+            None::<String>,
+        )
     };
 
     if has_parent {
@@ -694,7 +742,23 @@ async fn subagents(
             .await;
             results.push(result);
         }
-        return (StatusCode::OK, Json(results)).into_response();
+        let summary = if req.aggregate == Some(true) {
+            aggregate_subagent_results(
+                &state.cfg,
+                lead_provider.clone(),
+                lead_model.clone(),
+                req.aggregate_prompt.clone(),
+                &results,
+            )
+            .ok()
+        } else {
+            None
+        };
+        return (
+            StatusCode::OK,
+            Json(SubagentsResponse { results, summary }),
+        )
+            .into_response();
     }
 
     let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(max_concurrency));
@@ -724,8 +788,24 @@ async fn subagents(
             }),
         }
     }
+    let summary = if req.aggregate == Some(true) {
+        aggregate_subagent_results(
+            &state.cfg,
+            lead_provider,
+            lead_model,
+            req.aggregate_prompt.clone(),
+            &results,
+        )
+        .ok()
+    } else {
+        None
+    };
 
-    (StatusCode::OK, Json(results)).into_response()
+    (
+        StatusCode::OK,
+        Json(SubagentsResponse { results, summary }),
+    )
+        .into_response()
 }
 
 async fn run_subagent_task(
@@ -794,6 +874,43 @@ async fn run_subagent_task(
             error: Some("subagent run failed".to_string()),
         },
     }
+}
+
+async fn run_flow(
+    State(state): State<AppState>,
+    AxumPath(agent_id): AxumPath<String>,
+    Json(req): Json<FlowRequest>,
+) -> Response {
+    let (session_id, lead_model) = {
+        let store = state.store.lock().unwrap();
+        let agent = match store.agents.get(&agent_id) {
+            Some(agent) => agent,
+            None => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({"error": "agent not found"})),
+                )
+                    .into_response();
+            }
+        };
+        (agent.session_id.clone(), agent.model.clone())
+    };
+
+    let outputs = match execute_flow(
+        &state,
+        &session_id,
+        &agent_id,
+        req,
+        lead_model,
+    )
+    .await
+    {
+        Ok(outputs) => outputs,
+        Err(resp) => return resp,
+    };
+
+    (StatusCode::OK, Json(FlowResponse { status: "completed".to_string(), outputs }))
+        .into_response()
 }
 
 async fn run_agent(
@@ -1348,6 +1465,306 @@ fn summarize_messages(
     call_llm_with_messages(cfg, provider, model, &summary_messages)
 }
 
+fn aggregate_subagent_results(
+    cfg: &Config,
+    provider: Option<String>,
+    model: Option<String>,
+    prompt: Option<String>,
+    results: &[SubagentResult],
+) -> Result<String, String> {
+    let mut content = String::new();
+    for result in results {
+        content.push_str(&format!(
+            "Agent {} status={}:\n{}\n\n",
+            result.agent_id,
+            result.status,
+            result.output.clone().unwrap_or_else(|| "<no output>".to_string())
+        ));
+    }
+    let user_prompt = prompt.unwrap_or_else(|| "Aggregate the following subagent outputs into a concise synthesis with key findings and action items.".to_string());
+    let messages = vec![
+        ChatMessage {
+            role: "system".to_string(),
+            content: "You are a synthesis agent.".to_string(),
+        },
+        ChatMessage {
+            role: "user".to_string(),
+            content: format!("{}\n\n{}", user_prompt, content),
+        },
+    ];
+    call_llm_with_messages(cfg, provider, model, &messages)
+}
+
+async fn execute_flow(
+    state: &AppState,
+    session_id: &str,
+    agent_id: &str,
+    req: FlowRequest,
+    lead_model: Option<String>,
+) -> Result<BTreeMap<String, Value>, Response> {
+    let mut node_map: BTreeMap<String, FlowNode> = BTreeMap::new();
+    for node in req.nodes {
+        node_map.insert(node.id.clone(), node);
+    }
+    if node_map.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "flow nodes required"})),
+        )
+            .into_response());
+    }
+
+    let mut deps: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (id, node) in node_map.iter() {
+        if let Some(inputs) = &node.inputs {
+            deps.insert(id.clone(), inputs.clone());
+        } else {
+            deps.insert(id.clone(), Vec::new());
+        }
+    }
+    for edge in &req.edges {
+        deps.entry(edge.to.clone())
+            .or_default()
+            .push(edge.from.clone());
+    }
+
+    let mut outputs: BTreeMap<String, Value> = BTreeMap::new();
+    let mut completed: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let max_concurrency = req.max_concurrency.unwrap_or(4).max(1) as usize;
+    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(max_concurrency));
+
+    loop {
+        let ready: Vec<String> = deps
+            .iter()
+            .filter(|(id, _)| !completed.contains(*id))
+            .filter(|(_, deps)| deps.iter().all(|d| completed.contains(d)))
+            .map(|(id, _)| id.clone())
+            .collect();
+
+        if ready.is_empty() {
+            break;
+        }
+
+        let mut handles = Vec::new();
+        for node_id in ready {
+            let node = node_map.get(&node_id).cloned().unwrap();
+            let state = state.clone();
+            let semaphore = semaphore.clone();
+            let outputs_snapshot = outputs.clone();
+            let req_clone = FlowRequest {
+                nodes: Vec::new(),
+                edges: Vec::new(),
+                provider: req.provider.clone(),
+                model: req.model.clone(),
+                max_concurrency: req.max_concurrency,
+                tools: req.tools.clone(),
+                approved_tools: req.approved_tools.clone(),
+                approved: req.approved,
+            };
+            let lead_model = lead_model.clone();
+            let agent_id = agent_id.to_string();
+            let session_id = session_id.to_string();
+
+            let handle = tokio::spawn(async move {
+                let _permit = semaphore.acquire().await.ok();
+                let result = run_flow_node(
+                    &state,
+                    &session_id,
+                    &agent_id,
+                    &req_clone,
+                    lead_model,
+                    node,
+                    outputs_snapshot,
+                )
+                .await;
+                (node_id, result)
+            });
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            match handle.await {
+                Ok((node_id, Ok(value))) => {
+                    outputs.insert(node_id.clone(), value);
+                    completed.insert(node_id);
+                }
+                Ok((_, Err(resp))) => return Err(resp),
+                Err(err) => {
+                    return Err((
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({"error": format!("flow join error: {err}")})),
+                    )
+                        .into_response())
+                }
+            }
+        }
+    }
+
+    if completed.len() != node_map.len() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "flow has unresolved dependencies"})),
+        )
+            .into_response());
+    }
+
+    Ok(outputs)
+}
+
+async fn run_flow_node(
+    state: &AppState,
+    session_id: &str,
+    agent_id: &str,
+    req: &FlowRequest,
+    lead_model: Option<String>,
+    node: FlowNode,
+    outputs: BTreeMap<String, Value>,
+) -> Result<Value, Response> {
+    let kind = node.kind.to_lowercase();
+    match kind.as_str() {
+        "llm" => {
+            let mut prompt = node.prompt.unwrap_or_default();
+            if let Some(inputs) = node.inputs {
+                for input in inputs {
+                    if let Some(value) = outputs.get(&input) {
+                        prompt.push_str(&format!("\n\n[{}]\n{}", input, value));
+                    }
+                }
+            }
+            let messages = vec![
+                ChatMessage {
+                    role: "system".to_string(),
+                    content: "You are a flow node.".to_string(),
+                },
+                ChatMessage {
+                    role: "user".to_string(),
+                    content: prompt,
+                },
+            ];
+            call_llm_with_messages(
+                &state.cfg,
+                req.provider.clone(),
+                req.model.clone().or(lead_model),
+                &messages,
+            )
+            .map(|text| Value::String(text))
+            .map_err(|err| {
+                (
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({"error": err})),
+                )
+                    .into_response()
+            })
+        }
+        "tool" => {
+            let tool = node.tool.ok_or_else(|| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": "tool node requires tool"})),
+                )
+                    .into_response()
+            })?;
+            if let Some(allowed) = &req.tools {
+                if !allowed.iter().any(|name| name == &tool) {
+                    return Err((
+                        StatusCode::FORBIDDEN,
+                        Json(json!({"error": "tool not allowed", "tool": tool})),
+                    )
+                        .into_response());
+                }
+            }
+            let args = node.args.unwrap_or(Value::Null);
+            let args = render_template(args, &outputs);
+            execute_tool(
+                &state.cfg,
+                &tool,
+                args,
+                Some(session_id),
+                Some(agent_id),
+                req.approved == Some(true),
+                req.approved_tools.clone(),
+                false,
+                Some("flow preapproved".to_string()),
+            )
+            .map_err(|err| match err {
+                ToolExecError::ApprovalRequired => (
+                    StatusCode::FORBIDDEN,
+                    Json(json!({"error": "approval_required", "tool": tool})),
+                )
+                    .into_response(),
+                ToolExecError::Failed(status, value) => (status, Json(value)).into_response(),
+            })
+        }
+        "aggregate" => {
+            let mut prompt = node.prompt.unwrap_or_else(|| "Aggregate the following outputs.".to_string());
+            if let Some(inputs) = node.inputs {
+                for input in inputs {
+                    if let Some(value) = outputs.get(&input) {
+                        prompt.push_str(&format!("\n\n[{}]\n{}", input, value));
+                    }
+                }
+            }
+            let messages = vec![
+                ChatMessage {
+                    role: "system".to_string(),
+                    content: "You are an aggregator.".to_string(),
+                },
+                ChatMessage {
+                    role: "user".to_string(),
+                    content: prompt,
+                },
+            ];
+            call_llm_with_messages(
+                &state.cfg,
+                req.provider.clone(),
+                req.model.clone().or(lead_model),
+                &messages,
+            )
+            .map(|text| Value::String(text))
+            .map_err(|err| {
+                (
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({"error": err})),
+                )
+                    .into_response()
+            })
+        }
+        _ => Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("unknown node kind {}", node.kind)})),
+        )
+            .into_response()),
+    }
+}
+
+fn render_template(value: Value, outputs: &BTreeMap<String, Value>) -> Value {
+    match value {
+        Value::String(text) => {
+            let mut out = text;
+            for (key, val) in outputs {
+                let needle = format!("{{{{{}}}}}", key);
+                let replacement = match val {
+                    Value::String(s) => s.clone(),
+                    _ => val.to_string(),
+                };
+                out = out.replace(&needle, &replacement);
+            }
+            Value::String(out)
+        }
+        Value::Array(items) => {
+            Value::Array(items.into_iter().map(|v| render_template(v, outputs)).collect())
+        }
+        Value::Object(map) => {
+            let mut out = serde_json::Map::new();
+            for (k, v) in map {
+                out.insert(k, render_template(v, outputs));
+            }
+            Value::Object(out)
+        }
+        other => other,
+    }
+}
+
 fn extract_completion_text(value: &Value) -> Option<String> {
     let choices = value.get("choices")?.as_array()?;
     let first = choices.first()?;
@@ -1899,6 +2316,15 @@ mod tests {
         assert_eq!(tool_msgs.len(), 2);
         assert!(tool_msgs[0].content.contains("fs.read"));
         assert!(tool_msgs[1].content.contains("fs.list"));
+    }
+
+    #[test]
+    fn render_template_replaces_keys() {
+        let mut outputs = BTreeMap::new();
+        outputs.insert("node1".to_string(), Value::String("hello".to_string()));
+        let value = Value::String("Value: {{node1}}".to_string());
+        let rendered = render_template(value, &outputs);
+        assert_eq!(rendered, Value::String("Value: hello".to_string()));
     }
 }
 
