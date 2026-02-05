@@ -13,6 +13,7 @@ pub struct Config {
     pub logging: LoggingConfig,
     pub share: String,
     pub providers: ProvidersConfig,
+    pub tools: ToolsConfig,
 }
 
 impl Default for Config {
@@ -23,6 +24,7 @@ impl Default for Config {
             logging: LoggingConfig::default(),
             share: "manual".to_string(),
             providers: ProvidersConfig::default(),
+            tools: ToolsConfig::default(),
         }
     }
 }
@@ -71,6 +73,22 @@ impl Default for LoggingConfig {
         Self {
             dir: "~/.local/share/aish/logs".to_string(),
             retention_days: 30,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ToolsConfig {
+    pub default_policy: String,
+    pub policies: BTreeMap<String, String>,
+}
+
+impl Default for ToolsConfig {
+    fn default() -> Self {
+        Self {
+            default_policy: "ask".to_string(),
+            policies: BTreeMap::new(),
         }
     }
 }
