@@ -60,6 +60,7 @@ async fn main() -> Result<()> {
         .route("/v1/sessions/:id", get(get_session).patch(patch_session))
         .route("/v1/sessions/:id/agents", get(list_agents).post(create_agent))
         .route("/v1/agents/:id/run", post(run_agent))
+        .route("/v1/agents/:id/subagents", post(subagents))
         .route("/v1/diagnostics/tmux", get(diagnostics_tmux))
         .route("/v1/tools", get(list_tools))
         .route("/v1/tools/:name/call", post(call_tool))
@@ -173,8 +174,10 @@ struct RunAgentRequest {
     model: Option<String>,
     max_steps: Option<u32>,
     tools: Option<Vec<String>>,
+    approved_tools: Option<Vec<String>>,
     approved: Option<bool>,
     approval_reason: Option<String>,
+    context_editing: Option<ContextEditingConfig>,
 }
 
 #[derive(Debug, Serialize)]
@@ -189,6 +192,22 @@ struct RunAgentResponse {
 struct ToolCall {
     tool: String,
     args: Value,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct ContextEditingConfig {
+    clear_tool_uses: Option<ClearToolUses>,
+    compact: Option<CompactConfig>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct ClearToolUses {
+    keep_last: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct CompactConfig {
+    max_messages: Option<u32>,
 }
 
 async fn completions(
@@ -505,13 +524,24 @@ async fn create_agent(
     AxumPath(session_id): AxumPath<String>,
     Json(req): Json<CreateAgentRequest>,
 ) -> Response {
+    match create_agent_internal(&state, &session_id, req) {
+        Ok(agent) => (StatusCode::OK, Json(agent)).into_response(),
+        Err(resp) => resp,
+    }
+}
+
+fn create_agent_internal(
+    state: &AppState,
+    session_id: &str,
+    req: CreateAgentRequest,
+) -> Result<Agent, Response> {
     let mut store = state.store.lock().unwrap();
-    if !store.sessions.contains_key(&session_id) {
-        return (
+    if !store.sessions.contains_key(session_id) {
+        return Err((
             StatusCode::NOT_FOUND,
             Json(json!({"error": "session not found"})),
         )
-            .into_response();
+            .into_response());
     }
     let id = store.next_id("agent");
 
@@ -531,42 +561,42 @@ async fn create_agent(
             WorktreeMode::Inherit => parent_worktree.clone(),
             WorktreeMode::New(repo_path) => match create_worktree(
                 &state.cfg,
-                &session_id,
+                session_id,
                 &id,
                 &repo_path,
             ) {
                 Ok(path) => Some(path),
                 Err(err) => {
-                    return (
+                    return Err((
                         StatusCode::BAD_REQUEST,
                         Json(json!({"error": err})),
                     )
-                        .into_response();
+                        .into_response());
                 }
             },
         },
         Err(err) => {
-            return (
+            return Err((
                 StatusCode::BAD_REQUEST,
                 Json(json!({"error": err})),
             )
-                .into_response();
+                .into_response());
         }
     };
 
     let tmux_name = format!("{}-{}-{}", state.cfg.tmux.session_prefix, session_id, id);
     let tmux_cwd = worktree.as_deref();
     if let Err(err) = spawn_tmux_session(&tmux_name, tmux_cwd) {
-        return (
+        return Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": err.to_string()})),
         )
-            .into_response();
+            .into_response());
     }
 
     let agent = Agent {
         id: id.clone(),
-        session_id: session_id.clone(),
+        session_id: session_id.to_string(),
         parent_agent_id: req.parent_agent_id,
         model: req.model,
         status: "idle".to_string(),
@@ -575,23 +605,49 @@ async fn create_agent(
     };
     store.agents.insert(id.clone(), agent.clone());
     if let Err(err) = append_store_event(&state.store_path, StoreEvent::AgentUpsert(agent.clone())) {
-        return (
+        return Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": err.to_string()})),
         )
-            .into_response();
+            .into_response());
     }
-    (StatusCode::OK, Json(agent)).into_response()
+    Ok(agent)
 }
 
-async fn run_agent(
+#[derive(Debug, Deserialize)]
+struct SubagentRequest {
+    tasks: Vec<SubagentTask>,
+    mode: Option<String>,
+    max_concurrency: Option<u32>,
+    approved_tools: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct SubagentTask {
+    prompt: String,
+    model: Option<String>,
+    provider: Option<String>,
+    tools: Option<Vec<String>>,
+    repo_path: Option<String>,
+    worktree_mode: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct SubagentResult {
+    agent_id: String,
+    status: String,
+    output: Option<String>,
+    error: Option<String>,
+}
+
+async fn subagents(
     State(state): State<AppState>,
     AxumPath(agent_id): AxumPath<String>,
-    Json(req): Json<RunAgentRequest>,
+    Json(req): Json<SubagentRequest>,
 ) -> Response {
-    let (session_id, model_default) = {
-        let mut store = state.store.lock().unwrap();
-        let agent = match store.agents.get_mut(&agent_id) {
+    let (session_id, has_parent) = {
+        let store = state.store.lock().unwrap();
+        let agent = match store.agents.get(&agent_id) {
             Some(agent) => agent,
             None => {
                 return (
@@ -601,19 +657,194 @@ async fn run_agent(
                     .into_response();
             }
         };
+        (agent.session_id.clone(), agent.parent_agent_id.is_some())
+    };
+
+    if has_parent {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "subagents cannot spawn subagents"})),
+        )
+            .into_response();
+    }
+
+    let mode = req.mode.unwrap_or_else(|| "parallel".to_string());
+    let max_concurrency = req.max_concurrency.unwrap_or(4).max(1) as usize;
+    let approved_tools = req.approved_tools.clone();
+    let tasks = req.tasks.clone();
+
+    if tasks.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "tasks are required"})),
+        )
+            .into_response();
+    }
+
+    if mode == "sequential" {
+        let mut results = Vec::new();
+        for task in tasks {
+            let result = run_subagent_task(
+                state.clone(),
+                &session_id,
+                &agent_id,
+                task,
+                approved_tools.clone(),
+            )
+            .await;
+            results.push(result);
+        }
+        return (StatusCode::OK, Json(results)).into_response();
+    }
+
+    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(max_concurrency));
+    let mut handles = Vec::new();
+    for task in tasks {
+        let state = state.clone();
+        let session_id = session_id.clone();
+        let parent_id = agent_id.clone();
+        let approved_tools = approved_tools.clone();
+        let semaphore = semaphore.clone();
+        let handle = tokio::spawn(async move {
+            let _permit = semaphore.acquire().await.ok();
+            run_subagent_task(state, &session_id, &parent_id, task, approved_tools).await
+        });
+        handles.push(handle);
+    }
+
+    let mut results = Vec::new();
+    for handle in handles {
+        match handle.await {
+            Ok(result) => results.push(result),
+            Err(err) => results.push(SubagentResult {
+                agent_id: "unknown".to_string(),
+                status: "error".to_string(),
+                output: None,
+                error: Some(format!("join error: {err}")),
+            }),
+        }
+    }
+
+    (StatusCode::OK, Json(results)).into_response()
+}
+
+async fn run_subagent_task(
+    state: AppState,
+    session_id: &str,
+    parent_id: &str,
+    task: SubagentTask,
+    approved_tools: Option<Vec<String>>,
+) -> SubagentResult {
+    let create_req = CreateAgentRequest {
+        parent_agent_id: Some(parent_id.to_string()),
+        model: task.model.clone(),
+        worktree_mode: task.worktree_mode.clone().or(Some("inherit".to_string())),
+        repo_path: task.repo_path.clone(),
+    };
+
+    let agent = match create_agent_internal(&state, session_id, create_req) {
+        Ok(agent) => agent,
+        Err(_) => {
+            return SubagentResult {
+                agent_id: "unknown".to_string(),
+                status: "error".to_string(),
+                output: None,
+                error: Some("failed to create agent".to_string()),
+            }
+        }
+    };
+
+    let agent_id = agent.id.clone();
+    if agent_id == "unknown" {
+        return SubagentResult {
+            agent_id,
+            status: "error".to_string(),
+            output: None,
+            error: Some("failed to create agent".to_string()),
+        };
+    }
+
+    let run_req = RunAgentRequest {
+        prompt: task.prompt,
+        provider: task.provider,
+        model: task.model,
+        max_steps: Some(6),
+        tools: task.tools,
+        approved_tools: approved_tools.clone(),
+        approved: Some(false),
+        approval_reason: Some("subagent preapproved".to_string()),
+        context_editing: Some(ContextEditingConfig {
+            clear_tool_uses: Some(ClearToolUses { keep_last: Some(3) }),
+            compact: None,
+        }),
+    };
+
+    let response = run_agent_internal(&state, &agent_id, run_req, true).await;
+    match response {
+        Ok(resp) => SubagentResult {
+            agent_id,
+            status: resp.status,
+            output: resp.output,
+            error: None,
+        },
+        Err(_) => SubagentResult {
+            agent_id,
+            status: "error".to_string(),
+            output: None,
+            error: Some("subagent run failed".to_string()),
+        },
+    }
+}
+
+async fn run_agent(
+    State(state): State<AppState>,
+    AxumPath(agent_id): AxumPath<String>,
+    Json(req): Json<RunAgentRequest>,
+) -> Response {
+    match run_agent_internal(&state, &agent_id, req, false).await {
+        Ok(resp) => (StatusCode::OK, Json(resp)).into_response(),
+        Err(err) => err,
+    }
+}
+
+async fn run_agent_internal(
+    state: &AppState,
+    agent_id: &str,
+    mut req: RunAgentRequest,
+    deny_on_missing_approval: bool,
+) -> Result<RunAgentResponse, Response> {
+    let (session_id, model_default) = {
+        let mut store = state.store.lock().unwrap();
+        let agent = match store.agents.get_mut(agent_id) {
+            Some(agent) => agent,
+            None => {
+                return Err((
+                    StatusCode::NOT_FOUND,
+                    Json(json!({"error": "agent not found"})),
+                )
+                    .into_response());
+            }
+        };
         agent.status = "running".to_string();
         let updated = agent.clone();
         if let Err(err) =
             append_store_event(&state.store_path, StoreEvent::AgentUpsert(updated.clone()))
         {
-            return (
+            return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": err.to_string()})),
             )
-                .into_response();
+                .into_response());
         }
         (agent.session_id.clone(), agent.model.clone())
     };
+
+    if req.context_editing.is_none() {
+        req.context_editing = Some(ContextEditingConfig {
+            clear_tool_uses: Some(ClearToolUses { keep_last: Some(3) }),
+            compact: None,
+        });
+    }
 
     let max_steps = req.max_steps.unwrap_or(8);
     let mut messages = Vec::new();
@@ -632,22 +863,38 @@ async fn run_agent(
 
     while steps < max_steps {
         steps += 1;
-        let completion = match call_llm_with_messages(
+        let provider = req.provider.clone();
+        let model = req.model.clone().or(model_default.clone());
+        let view = apply_context_editing(
             &state.cfg,
-            req.provider.clone(),
-            req.model.clone().or(model_default.clone()),
+            provider.clone(),
+            model.clone(),
             &messages,
-        ) {
-            Ok(text) => text,
-            Err(err) => {
-                set_agent_status(&state, &agent_id, "error");
-                return (
-                    StatusCode::BAD_GATEWAY,
-                    Json(json!({"error": err})),
-                )
-                    .into_response();
-            }
-        };
+            req.context_editing.clone(),
+        )
+        .map_err(|err| {
+            set_agent_status(state, agent_id, "error");
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"error": err})),
+            )
+                .into_response()
+        })?;
+
+        let completion = call_llm_with_messages(
+            &state.cfg,
+            provider.clone(),
+            model.clone(),
+            &view,
+        )
+        .map_err(|err| {
+            set_agent_status(state, agent_id, "error");
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"error": err})),
+            )
+                .into_response()
+        })?;
 
         messages.push(ChatMessage {
             role: "assistant".to_string(),
@@ -663,12 +910,12 @@ async fn run_agent(
         for call in tool_calls {
             if let Some(allowed) = &req.tools {
                 if !allowed.iter().any(|name| name == &call.tool) {
-                    set_agent_status(&state, &agent_id, "error");
-                    return (
+                    set_agent_status(state, agent_id, "error");
+                    return Err((
                         StatusCode::FORBIDDEN,
                         Json(json!({"error": "tool not allowed", "tool": call.tool})),
                     )
-                        .into_response();
+                        .into_response());
                 }
             }
 
@@ -677,8 +924,10 @@ async fn run_agent(
                 &call.tool,
                 call.args.clone(),
                 Some(&session_id),
-                Some(&agent_id),
+                Some(agent_id),
                 req.approved == Some(true),
+                req.approved_tools.clone(),
+                deny_on_missing_approval,
                 req.approval_reason.clone(),
             ) {
                 Ok(result) => {
@@ -692,8 +941,8 @@ async fn run_agent(
                     break;
                 }
                 Err(ToolExecError::Failed(status, err)) => {
-                    set_agent_status(&state, &agent_id, "error");
-                    return (status, Json(err)).into_response();
+                    set_agent_status(state, agent_id, "error");
+                    return Err((status, Json(err)).into_response());
                 }
             }
         }
@@ -703,28 +952,23 @@ async fn run_agent(
         }
     }
 
-    set_agent_status(&state, &agent_id, "idle");
+    set_agent_status(state, agent_id, "idle");
 
     if let Some(pending) = pending {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(RunAgentResponse {
-                status: "approval_required".to_string(),
-                output: output.clone(),
-                steps,
-                pending_tool_call: Some(pending),
-            }),
-        )
-            .into_response();
+        return Ok(RunAgentResponse {
+            status: "approval_required".to_string(),
+            output,
+            steps,
+            pending_tool_call: Some(pending),
+        });
     }
 
-    (StatusCode::OK, Json(RunAgentResponse {
+    Ok(RunAgentResponse {
         status: "completed".to_string(),
         output,
         steps,
         pending_tool_call: None,
-    }))
-        .into_response()
+    })
 }
 
 async fn diagnostics_tmux() -> Response {
@@ -998,6 +1242,112 @@ fn call_llm_with_messages(
         .ok_or_else(|| "no completion text returned".to_string())
 }
 
+fn apply_context_editing(
+    cfg: &Config,
+    provider: Option<String>,
+    model: Option<String>,
+    messages: &[ChatMessage],
+    config: Option<ContextEditingConfig>,
+) -> Result<Vec<ChatMessage>, String> {
+    let mut view = messages.to_vec();
+    let config = config.unwrap_or(ContextEditingConfig {
+        clear_tool_uses: Some(ClearToolUses { keep_last: Some(3) }),
+        compact: None,
+    });
+
+    if let Some(compact) = config.compact {
+        view = compact_messages(cfg, provider.clone(), model.clone(), &view, compact)?;
+    }
+    if let Some(clear) = config.clear_tool_uses {
+        let keep = clear.keep_last.unwrap_or(3);
+        view = clear_tool_uses(&view, keep);
+    }
+    Ok(view)
+}
+
+fn clear_tool_uses(messages: &[ChatMessage], keep_last: u32) -> Vec<ChatMessage> {
+    let mut tool_indices = Vec::new();
+    for (idx, msg) in messages.iter().enumerate() {
+        if msg.role == "user" && msg.content.starts_with("Tool result for ") {
+            tool_indices.push(idx);
+        }
+    }
+    if keep_last as usize >= tool_indices.len() {
+        return messages.to_vec();
+    }
+    let keep_set: std::collections::HashSet<usize> = tool_indices
+        .iter()
+        .rev()
+        .take(keep_last as usize)
+        .cloned()
+        .collect();
+    messages
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, msg)| {
+            if msg.role == "user" && msg.content.starts_with("Tool result for ") {
+                if keep_set.contains(&idx) {
+                    Some(msg.clone())
+                } else {
+                    None
+                }
+            } else {
+                Some(msg.clone())
+            }
+        })
+        .collect()
+}
+
+fn compact_messages(
+    cfg: &Config,
+    provider: Option<String>,
+    model: Option<String>,
+    messages: &[ChatMessage],
+    compact: CompactConfig,
+) -> Result<Vec<ChatMessage>, String> {
+    let max_messages = compact.max_messages.unwrap_or(30) as usize;
+    if messages.len() <= max_messages {
+        return Ok(messages.to_vec());
+    }
+    let keep_tail = std::cmp::max(4, max_messages / 2);
+    if messages.len() <= keep_tail {
+        return Ok(messages.to_vec());
+    }
+    let split_idx = messages.len() - keep_tail;
+    let (head, tail) = messages.split_at(split_idx);
+    let summary = summarize_messages(cfg, provider, model, head)?;
+    let mut out = Vec::new();
+    out.push(ChatMessage {
+        role: "system".to_string(),
+        content: format!("Summary of earlier context:\n{}", summary),
+    });
+    out.extend_from_slice(tail);
+    Ok(out)
+}
+
+fn summarize_messages(
+    cfg: &Config,
+    provider: Option<String>,
+    model: Option<String>,
+    messages: &[ChatMessage],
+) -> Result<String, String> {
+    let mut summary_prompt = String::from("Summarize the following conversation for future context. Keep it concise and preserve key decisions, facts, and TODOs.\n\n");
+    for msg in messages {
+        summary_prompt.push_str(&format!("[{}] {}\n", msg.role, msg.content));
+    }
+    let summary_messages = vec![
+        ChatMessage {
+            role: "system".to_string(),
+            content: "You are a summarizer.".to_string(),
+        },
+        ChatMessage {
+            role: "user".to_string(),
+            content: summary_prompt,
+        },
+    ];
+    call_llm_with_messages(cfg, provider, model, &summary_messages)
+}
+
 fn extract_completion_text(value: &Value) -> Option<String> {
     let choices = value.get("choices")?.as_array()?;
     let first = choices.first()?;
@@ -1105,6 +1455,8 @@ fn execute_tool(
     session_id: Option<&str>,
     agent_id: Option<&str>,
     approved: bool,
+    approved_tools: Option<Vec<String>>,
+    deny_on_missing: bool,
     approval_reason: Option<String>,
 ) -> Result<Value, ToolExecError> {
     let policy = policy_for(cfg, name);
@@ -1116,7 +1468,27 @@ fn execute_tool(
             ));
         }
         ToolPolicy::Ask => {
-            if !approved {
+            if let Some(allowed) = &approved_tools {
+                if allowed.iter().any(|tool| tool == name) {
+                    // pre-approved
+                } else if approved {
+                    // globally approved
+                } else if deny_on_missing {
+                    return Err(ToolExecError::Failed(
+                        StatusCode::FORBIDDEN,
+                        json!({"error": "approval_required", "tool": name}),
+                    ));
+                } else {
+                    return Err(ToolExecError::ApprovalRequired);
+                }
+            } else if approved {
+                // globally approved
+            } else if deny_on_missing {
+                return Err(ToolExecError::Failed(
+                    StatusCode::FORBIDDEN,
+                    json!({"error": "approval_required", "tool": name}),
+                ));
+            } else {
                 return Err(ToolExecError::ApprovalRequired);
             }
         }
@@ -1497,6 +1869,36 @@ mod tests {
             WorktreeMode::New(path) => assert_eq!(path, "/tmp/repo"),
             _ => panic!("expected new"),
         }
+    }
+
+    #[test]
+    fn clear_tool_uses_keeps_last() {
+        let messages = vec![
+            ChatMessage {
+                role: "user".to_string(),
+                content: "Tool result for shell:\n1".to_string(),
+            },
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: "ok".to_string(),
+            },
+            ChatMessage {
+                role: "user".to_string(),
+                content: "Tool result for fs.read:\n2".to_string(),
+            },
+            ChatMessage {
+                role: "user".to_string(),
+                content: "Tool result for fs.list:\n3".to_string(),
+            },
+        ];
+        let cleared = clear_tool_uses(&messages, 2);
+        let tool_msgs: Vec<_> = cleared
+            .iter()
+            .filter(|m| m.role == "user" && m.content.starts_with("Tool result for "))
+            .collect();
+        assert_eq!(tool_msgs.len(), 2);
+        assert!(tool_msgs[0].content.contains("fs.read"));
+        assert!(tool_msgs[1].content.contains("fs.list"));
     }
 }
 
