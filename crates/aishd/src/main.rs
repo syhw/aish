@@ -7,6 +7,7 @@ use axum::{
 };
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
+use axum::response::sse::{Event, Sse};
 use clap::Parser;
 use aish_core::config::{self, Config, OpenAICompatConfig};
 use serde::{Deserialize, Serialize};
@@ -15,8 +16,13 @@ use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::net::TcpListener;
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::StreamExt;
 use chrono::Utc;
 
 #[derive(Parser)]
@@ -50,6 +56,7 @@ async fn main() -> Result<()> {
         cfg,
         store: std::sync::Arc::new(std::sync::Mutex::new(store)),
         store_path,
+        run_cancels: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
     };
 
     let app = Router::new()
@@ -60,8 +67,13 @@ async fn main() -> Result<()> {
         .route("/v1/sessions/:id", get(get_session).patch(patch_session))
         .route("/v1/sessions/:id/agents", get(list_agents).post(create_agent))
         .route("/v1/agents/:id/run", post(run_agent))
+        .route("/v1/agents/:id/run/stream", post(run_agent_stream))
         .route("/v1/agents/:id/subagents", post(subagents))
         .route("/v1/agents/:id/flow", post(run_flow))
+        .route("/v1/agents/:id/flow/stream", post(run_flow_stream))
+        .route("/v1/runs", get(list_runs))
+        .route("/v1/runs/:id", get(get_run))
+        .route("/v1/runs/:id/cancel", post(cancel_run))
         .route("/v1/diagnostics/tmux", get(diagnostics_tmux))
         .route("/v1/tools", get(list_tools))
         .route("/v1/tools/:name/call", post(call_tool))
@@ -153,6 +165,7 @@ struct AppState {
     cfg: Config,
     store: std::sync::Arc<std::sync::Mutex<Store>>,
     store_path: PathBuf,
+    run_cancels: Arc<std::sync::Mutex<BTreeMap<String, Arc<AtomicBool>>>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -187,6 +200,7 @@ struct RunAgentResponse {
     output: Option<String>,
     steps: u32,
     pending_tool_call: Option<ToolCall>,
+    run_id: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -512,6 +526,42 @@ async fn list_agents(
     (StatusCode::OK, Json(agents)).into_response()
 }
 
+async fn list_runs(State(state): State<AppState>) -> Response {
+    let store = state.store.lock().unwrap();
+    let runs = store.runs.values().cloned().collect::<Vec<_>>();
+    (StatusCode::OK, Json(runs)).into_response()
+}
+
+async fn get_run(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    let store = state.store.lock().unwrap();
+    match store.runs.get(&id) {
+        Some(run) => (StatusCode::OK, Json(run)).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "run not found"})),
+        )
+            .into_response(),
+    }
+}
+
+async fn cancel_run(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    let cancel = {
+        let mut cancels = state.run_cancels.lock().unwrap();
+        cancels
+            .entry(id.clone())
+            .or_insert_with(|| Arc::new(AtomicBool::new(false)))
+            .clone()
+    };
+    cancel.store(true, Ordering::SeqCst);
+    (StatusCode::OK, Json(json!({"ok": true}))).into_response()
+}
+
 #[derive(Debug, Deserialize)]
 struct CreateAgentRequest {
     parent_agent_id: Option<String>,
@@ -615,6 +665,44 @@ fn create_agent_internal(
     Ok(agent)
 }
 
+fn create_run(state: &AppState, session_id: &str, agent_id: &str, mode: &str) -> Run {
+    let mut store = state.store.lock().unwrap();
+    let id = store.next_id("run");
+    let now = now_ms();
+    let run = Run {
+        id: id.clone(),
+        session_id: session_id.to_string(),
+        agent_id: agent_id.to_string(),
+        mode: mode.to_string(),
+        status: "running".to_string(),
+        started_at: now,
+        ended_at: None,
+    };
+    store.runs.insert(id.clone(), run.clone());
+    let _ = append_store_event(&state.store_path, StoreEvent::RunUpsert(run.clone()));
+    run
+}
+
+fn update_run_status(state: &AppState, run_id: &str, status: &str) {
+    let mut store = state.store.lock().unwrap();
+    if let Some(run) = store.runs.get_mut(run_id) {
+        run.status = status.to_string();
+        if status != "running" {
+            run.ended_at = Some(now_ms());
+        }
+        let updated = run.clone();
+        let _ = append_store_event(&state.store_path, StoreEvent::RunUpsert(updated));
+    }
+}
+
+fn cancel_token(state: &AppState, run_id: &str) -> Arc<AtomicBool> {
+    let mut cancels = state.run_cancels.lock().unwrap();
+    cancels
+        .entry(run_id.to_string())
+        .or_insert_with(|| Arc::new(AtomicBool::new(false)))
+        .clone()
+}
+
 #[derive(Debug, Deserialize)]
 struct SubagentRequest {
     tasks: Vec<SubagentTask>,
@@ -641,6 +729,7 @@ struct SubagentResult {
     status: String,
     output: Option<String>,
     error: Option<String>,
+    run_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -681,6 +770,44 @@ struct FlowEdge {
 struct FlowResponse {
     status: String,
     outputs: BTreeMap<String, Value>,
+    run_id: Option<String>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct RunEvent {
+    r#type: String,
+    run_id: String,
+    session_id: String,
+    agent_id: String,
+    ts_ms: u128,
+    payload: Value,
+}
+
+#[derive(Clone)]
+struct RunContext {
+    run_id: String,
+    session_id: String,
+    agent_id: String,
+    sender: Option<mpsc::Sender<RunEvent>>,
+    cancel: Arc<AtomicBool>,
+}
+
+impl RunContext {
+    async fn emit(&self, kind: &str, payload: Value) -> Result<(), ()> {
+        let sender = match &self.sender {
+            Some(sender) => sender,
+            None => return Ok(()),
+        };
+        let event = RunEvent {
+            r#type: kind.to_string(),
+            run_id: self.run_id.clone(),
+            session_id: self.session_id.clone(),
+            agent_id: self.agent_id.clone(),
+            ts_ms: now_ms(),
+            payload,
+        };
+        sender.send(event).await.map_err(|_| ())
+    }
 }
 
 async fn subagents(
@@ -785,6 +912,7 @@ async fn subagents(
                 status: "error".to_string(),
                 output: None,
                 error: Some(format!("join error: {err}")),
+                run_id: None,
             }),
         }
     }
@@ -830,6 +958,7 @@ async fn run_subagent_task(
                 status: "error".to_string(),
                 output: None,
                 error: Some("failed to create agent".to_string()),
+                run_id: None,
             }
         }
     };
@@ -841,8 +970,19 @@ async fn run_subagent_task(
             status: "error".to_string(),
             output: None,
             error: Some("failed to create agent".to_string()),
+            run_id: None,
         };
     }
+
+    let run = create_run(&state, session_id, &agent_id, "subagent");
+    let cancel = cancel_token(&state, &run.id);
+    let ctx = RunContext {
+        run_id: run.id.clone(),
+        session_id: session_id.to_string(),
+        agent_id: agent_id.clone(),
+        sender: None,
+        cancel,
+    };
 
     let run_req = RunAgentRequest {
         prompt: task.prompt,
@@ -859,20 +999,28 @@ async fn run_subagent_task(
         }),
     };
 
-    let response = run_agent_internal(&state, &agent_id, run_req, true).await;
+    let response = run_agent_internal(&state, &agent_id, run_req, true, ctx.clone()).await;
     match response {
-        Ok(resp) => SubagentResult {
-            agent_id,
-            status: resp.status,
-            output: resp.output,
-            error: None,
-        },
-        Err(_) => SubagentResult {
-            agent_id,
-            status: "error".to_string(),
-            output: None,
-            error: Some("subagent run failed".to_string()),
-        },
+        Ok(resp) => {
+            update_run_status(&state, &run.id, &resp.status);
+            SubagentResult {
+                agent_id,
+                status: resp.status,
+                output: resp.output,
+                error: None,
+                run_id: resp.run_id.or(Some(run.id)),
+            }
+        }
+        Err(_) => {
+            update_run_status(&state, &run.id, "error");
+            SubagentResult {
+                agent_id,
+                status: "error".to_string(),
+                output: None,
+                error: Some("subagent run failed".to_string()),
+                run_id: Some(run.id),
+            }
+        }
     }
 }
 
@@ -896,21 +1044,108 @@ async fn run_flow(
         (agent.session_id.clone(), agent.model.clone())
     };
 
+    let run = create_run(&state, &session_id, &agent_id, "flow");
+    let cancel = cancel_token(&state, &run.id);
+    let ctx = RunContext {
+        run_id: run.id.clone(),
+        session_id: session_id.clone(),
+        agent_id: agent_id.clone(),
+        sender: None,
+        cancel,
+    };
+
     let outputs = match execute_flow(
         &state,
         &session_id,
         &agent_id,
         req,
         lead_model,
+        Some(ctx.clone()),
     )
     .await
     {
         Ok(outputs) => outputs,
-        Err(resp) => return resp,
+        Err(resp) => {
+            if ctx.cancel.load(Ordering::SeqCst) {
+                update_run_status(&state, &run.id, "canceled");
+            } else {
+                update_run_status(&state, &run.id, "error");
+            }
+            return resp;
+        }
+    };
+    update_run_status(&state, &run.id, "completed");
+
+    (StatusCode::OK, Json(FlowResponse { status: "completed".to_string(), outputs, run_id: Some(run.id) }))
+        .into_response()
+}
+
+async fn run_flow_stream(
+    State(state): State<AppState>,
+    AxumPath(agent_id): AxumPath<String>,
+    Json(req): Json<FlowRequest>,
+) -> Response {
+    let (session_id, lead_model) = {
+        let store = state.store.lock().unwrap();
+        let agent = match store.agents.get(&agent_id) {
+            Some(agent) => agent,
+            None => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({"error": "agent not found"})),
+                )
+                    .into_response();
+            }
+        };
+        (agent.session_id.clone(), agent.model.clone())
     };
 
-    (StatusCode::OK, Json(FlowResponse { status: "completed".to_string(), outputs }))
-        .into_response()
+    let run = create_run(&state, &session_id, &agent_id, "flow");
+    let cancel = cancel_token(&state, &run.id);
+    let (tx, rx) = mpsc::channel(100);
+    let ctx = RunContext {
+        run_id: run.id.clone(),
+        session_id: session_id.clone(),
+        agent_id: agent_id.clone(),
+        sender: Some(tx.clone()),
+        cancel,
+    };
+
+    tokio::spawn({
+        let state = state.clone();
+        async move {
+            let result = execute_flow(
+                &state,
+                &session_id,
+                &agent_id,
+                req,
+                lead_model,
+                Some(ctx.clone()),
+            )
+            .await;
+            match result {
+                Ok(_) => {
+                    update_run_status(&state, &run.id, "completed");
+                    let _ = ctx.emit("run.end", json!({"status": "completed"})).await;
+                }
+                Err(_) => {
+                    if ctx.cancel.load(Ordering::SeqCst) {
+                        update_run_status(&state, &run.id, "canceled");
+                        let _ = ctx.emit("run.canceled", json!({})).await;
+                    } else {
+                        update_run_status(&state, &run.id, "error");
+                        let _ = ctx.emit("run.error", json!({"error": "flow failed"})).await;
+                    }
+                }
+            }
+        }
+    });
+
+    let stream = ReceiverStream::new(rx).map(|event| {
+        let data = serde_json::to_string(&event).unwrap_or_else(|_| "{}".to_string());
+        Ok::<Event, std::convert::Infallible>(Event::default().event(event.r#type).data(data))
+    });
+    Sse::new(stream).into_response()
 }
 
 async fn run_agent(
@@ -918,10 +1153,93 @@ async fn run_agent(
     AxumPath(agent_id): AxumPath<String>,
     Json(req): Json<RunAgentRequest>,
 ) -> Response {
-    match run_agent_internal(&state, &agent_id, req, false).await {
-        Ok(resp) => (StatusCode::OK, Json(resp)).into_response(),
-        Err(err) => err,
+    let session_id = {
+        let store = state.store.lock().unwrap();
+        match store.agents.get(&agent_id) {
+            Some(agent) => agent.session_id.clone(),
+            None => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({"error": "agent not found"})),
+                )
+                    .into_response();
+            }
+        }
+    };
+    let run = create_run(&state, &session_id, &agent_id, "agent");
+    let cancel = cancel_token(&state, &run.id);
+    let ctx = RunContext {
+        run_id: run.id.clone(),
+        session_id,
+        agent_id: agent_id.clone(),
+        sender: None,
+        cancel,
+    };
+
+    match run_agent_internal(&state, &agent_id, req, false, ctx).await {
+        Ok(resp) => {
+            update_run_status(&state, &run.id, &resp.status);
+            (StatusCode::OK, Json(resp)).into_response()
+        }
+        Err(err) => {
+            update_run_status(&state, &run.id, "error");
+            err
+        }
     }
+}
+
+async fn run_agent_stream(
+    State(state): State<AppState>,
+    AxumPath(agent_id): AxumPath<String>,
+    Json(req): Json<RunAgentRequest>,
+) -> Response {
+    let session_id = {
+        let store = state.store.lock().unwrap();
+        match store.agents.get(&agent_id) {
+            Some(agent) => agent.session_id.clone(),
+            None => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({"error": "agent not found"})),
+                )
+                    .into_response();
+            }
+        }
+    };
+
+    let run = create_run(&state, &session_id, &agent_id, "agent");
+    let cancel = cancel_token(&state, &run.id);
+    let (tx, rx) = mpsc::channel(100);
+    let ctx = RunContext {
+        run_id: run.id.clone(),
+        session_id: session_id.clone(),
+        agent_id: agent_id.clone(),
+        sender: Some(tx.clone()),
+        cancel,
+    };
+
+    tokio::spawn({
+        let state = state.clone();
+        async move {
+            let result = run_agent_internal(&state, &agent_id, req, false, ctx.clone()).await;
+            match result {
+                Ok(resp) => {
+                    update_run_status(&state, &run.id, &resp.status);
+                    let _ = ctx.emit("run.end", json!({"status": resp.status, "steps": resp.steps})).await;
+                }
+                Err(_) => {
+                    update_run_status(&state, &run.id, "error");
+                    let _ = ctx.emit("run.error", json!({"error": "run failed"})).await;
+                }
+            }
+        }
+    });
+
+    let stream = ReceiverStream::new(rx).map(|event| {
+        let data = serde_json::to_string(&event).unwrap_or_else(|_| "{}".to_string());
+        Ok::<Event, std::convert::Infallible>(Event::default().event(event.r#type).data(data))
+    });
+    Sse::new(stream).into_response()
 }
 
 async fn run_agent_internal(
@@ -929,6 +1247,7 @@ async fn run_agent_internal(
     agent_id: &str,
     mut req: RunAgentRequest,
     deny_on_missing_approval: bool,
+    ctx: RunContext,
 ) -> Result<RunAgentResponse, Response> {
     let (session_id, model_default) = {
         let mut store = state.store.lock().unwrap();
@@ -978,7 +1297,20 @@ async fn run_agent_internal(
     let mut output: Option<String> = None;
     let mut pending: Option<ToolCall> = None;
 
+    ctx.emit("run.start", json!({"steps": max_steps})).await.ok();
+
     while steps < max_steps {
+        if ctx.cancel.load(Ordering::SeqCst) {
+            ctx.emit("run.canceled", json!({})).await.ok();
+            update_run_status(state, &ctx.run_id, "canceled");
+            return Ok(RunAgentResponse {
+                status: "canceled".to_string(),
+                output,
+                steps,
+                pending_tool_call: None,
+                run_id: Some(ctx.run_id.clone()),
+            });
+        }
         steps += 1;
         let provider = req.provider.clone();
         let model = req.model.clone().or(model_default.clone());
@@ -998,6 +1330,7 @@ async fn run_agent_internal(
                 .into_response()
         })?;
 
+        ctx.emit("message.start", json!({"step": steps})).await.ok();
         let completion = call_llm_with_messages(
             &state.cfg,
             provider.clone(),
@@ -1017,6 +1350,7 @@ async fn run_agent_internal(
             role: "assistant".to_string(),
             content: completion.clone(),
         });
+        ctx.emit("message.end", json!({"step": steps})).await.ok();
 
         let tool_calls = parse_tool_calls(&completion);
         if tool_calls.is_empty() {
@@ -1036,6 +1370,7 @@ async fn run_agent_internal(
                 }
             }
 
+            ctx.emit("tool.start", json!({"tool": call.tool})).await.ok();
             match execute_tool(
                 &state.cfg,
                 &call.tool,
@@ -1052,12 +1387,15 @@ async fn run_agent_internal(
                         role: "user".to_string(),
                         content: format!("Tool result for {}:\n{}", call.tool, result),
                     });
+                    ctx.emit("tool.end", json!({"tool": call.tool, "ok": true})).await.ok();
                 }
                 Err(ToolExecError::ApprovalRequired) => {
+                    ctx.emit("tool.end", json!({"tool": call.tool, "ok": false, "error": "approval_required"})).await.ok();
                     pending = Some(call);
                     break;
                 }
                 Err(ToolExecError::Failed(status, err)) => {
+                    ctx.emit("tool.end", json!({"tool": call.tool, "ok": false})).await.ok();
                     set_agent_status(state, agent_id, "error");
                     return Err((status, Json(err)).into_response());
                 }
@@ -1077,6 +1415,7 @@ async fn run_agent_internal(
             output,
             steps,
             pending_tool_call: Some(pending),
+            run_id: Some(ctx.run_id.clone()),
         });
     }
 
@@ -1085,6 +1424,7 @@ async fn run_agent_internal(
         output,
         steps,
         pending_tool_call: None,
+        run_id: Some(ctx.run_id.clone()),
     })
 }
 
@@ -1501,6 +1841,7 @@ async fn execute_flow(
     agent_id: &str,
     req: FlowRequest,
     lead_model: Option<String>,
+    ctx: Option<RunContext>,
 ) -> Result<BTreeMap<String, Value>, Response> {
     let mut node_map: BTreeMap<String, FlowNode> = BTreeMap::new();
     for node in req.nodes {
@@ -1564,6 +1905,7 @@ async fn execute_flow(
             let lead_model = lead_model.clone();
             let agent_id = agent_id.to_string();
             let session_id = session_id.to_string();
+            let ctx_clone = ctx.clone();
 
             let handle = tokio::spawn(async move {
                 let _permit = semaphore.acquire().await.ok();
@@ -1575,6 +1917,7 @@ async fn execute_flow(
                     lead_model,
                     node,
                     outputs_snapshot,
+                    ctx_clone,
                 )
                 .await;
                 (node_id, result)
@@ -1619,7 +1962,25 @@ async fn run_flow_node(
     lead_model: Option<String>,
     node: FlowNode,
     outputs: BTreeMap<String, Value>,
+    ctx: Option<RunContext>,
 ) -> Result<Value, Response> {
+    if let Some(ctx) = &ctx {
+        if ctx.cancel.load(Ordering::SeqCst) {
+            update_run_status(state, &ctx.run_id, "canceled");
+            let _ = ctx.emit("run.canceled", json!({})).await;
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(json!({"error": "run canceled"})),
+            )
+                .into_response());
+        }
+        let _ = ctx
+            .emit(
+                "flow.node.start",
+                json!({"node": node.id, "kind": node.kind}),
+            )
+            .await;
+    }
     let kind = node.kind.to_lowercase();
     match kind.as_str() {
         "llm" => {
@@ -1641,7 +2002,7 @@ async fn run_flow_node(
                     content: prompt,
                 },
             ];
-            call_llm_with_messages(
+            let result = call_llm_with_messages(
                 &state.cfg,
                 req.provider.clone(),
                 req.model.clone().or(lead_model),
@@ -1654,7 +2015,13 @@ async fn run_flow_node(
                     Json(json!({"error": err})),
                 )
                     .into_response()
-            })
+            })?;
+            if let Some(ctx) = &ctx {
+                let _ = ctx
+                    .emit("flow.node.end", json!({"node": node.id, "ok": true}))
+                    .await;
+            }
+            Ok(result)
         }
         "tool" => {
             let tool = node.tool.ok_or_else(|| {
@@ -1675,7 +2042,10 @@ async fn run_flow_node(
             }
             let args = node.args.unwrap_or(Value::Null);
             let args = render_template(args, &outputs);
-            execute_tool(
+            if let Some(ctx) = &ctx {
+                let _ = ctx.emit("tool.start", json!({"tool": tool})).await;
+            }
+            let result = execute_tool(
                 &state.cfg,
                 &tool,
                 args,
@@ -1693,7 +2063,14 @@ async fn run_flow_node(
                 )
                     .into_response(),
                 ToolExecError::Failed(status, value) => (status, Json(value)).into_response(),
-            })
+            })?;
+            if let Some(ctx) = &ctx {
+                let _ = ctx.emit("tool.end", json!({"tool": tool, "ok": true})).await;
+                let _ = ctx
+                    .emit("flow.node.end", json!({"node": node.id, "ok": true}))
+                    .await;
+            }
+            Ok(result)
         }
         "aggregate" => {
             let mut prompt = node.prompt.unwrap_or_else(|| "Aggregate the following outputs.".to_string());
@@ -1714,7 +2091,7 @@ async fn run_flow_node(
                     content: prompt,
                 },
             ];
-            call_llm_with_messages(
+            let result = call_llm_with_messages(
                 &state.cfg,
                 req.provider.clone(),
                 req.model.clone().or(lead_model),
@@ -1727,7 +2104,13 @@ async fn run_flow_node(
                     Json(json!({"error": err})),
                 )
                     .into_response()
-            })
+            })?;
+            if let Some(ctx) = &ctx {
+                let _ = ctx
+                    .emit("flow.node.end", json!({"node": node.id, "ok": true}))
+                    .await;
+            }
+            Ok(result)
         }
         _ => Err((
             StatusCode::BAD_REQUEST,
@@ -2479,10 +2862,22 @@ struct Agent {
     worktree: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Run {
+    id: String,
+    session_id: String,
+    agent_id: String,
+    mode: String,
+    status: String,
+    started_at: u128,
+    ended_at: Option<u128>,
+}
+
 #[derive(Debug, Default)]
 struct Store {
     sessions: BTreeMap<String, Session>,
     agents: BTreeMap<String, Agent>,
+    runs: BTreeMap<String, Run>,
     seq: u64,
 }
 
@@ -2511,6 +2906,8 @@ enum StoreEvent {
     SessionUpsert(Session),
     #[serde(rename = "agent.upsert")]
     AgentUpsert(Agent),
+    #[serde(rename = "run.upsert")]
+    RunUpsert(Run),
 }
 
 fn load_store(path: &Path) -> Result<Store, std::io::Error> {
@@ -2540,6 +2937,10 @@ fn apply_event(store: &mut Store, event: StoreEvent) {
         StoreEvent::AgentUpsert(agent) => {
             store.update_seq_from_id(&agent.id);
             store.agents.insert(agent.id.clone(), agent);
+        }
+        StoreEvent::RunUpsert(run) => {
+            store.update_seq_from_id(&run.id);
+            store.runs.insert(run.id.clone(), run);
         }
     }
 }
