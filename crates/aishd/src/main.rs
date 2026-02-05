@@ -496,6 +496,8 @@ async fn list_agents(
 struct CreateAgentRequest {
     parent_agent_id: Option<String>,
     model: Option<String>,
+    worktree_mode: Option<String>,
+    repo_path: Option<String>,
 }
 
 async fn create_agent(
@@ -512,8 +514,49 @@ async fn create_agent(
             .into_response();
     }
     let id = store.next_id("agent");
+
+    let parent_worktree = req
+        .parent_agent_id
+        .as_ref()
+        .and_then(|parent_id| store.agents.get(parent_id))
+        .and_then(|agent| agent.worktree.clone());
+
+    let worktree = match resolve_worktree_mode(
+        req.worktree_mode.as_deref(),
+        req.repo_path.as_deref(),
+        parent_worktree.as_deref(),
+    ) {
+        Ok(mode) => match mode {
+            WorktreeMode::None => None,
+            WorktreeMode::Inherit => parent_worktree.clone(),
+            WorktreeMode::New(repo_path) => match create_worktree(
+                &state.cfg,
+                &session_id,
+                &id,
+                &repo_path,
+            ) {
+                Ok(path) => Some(path),
+                Err(err) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({"error": err})),
+                    )
+                        .into_response();
+                }
+            },
+        },
+        Err(err) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": err})),
+            )
+                .into_response();
+        }
+    };
+
     let tmux_name = format!("{}-{}-{}", state.cfg.tmux.session_prefix, session_id, id);
-    if let Err(err) = spawn_tmux_session(&tmux_name) {
+    let tmux_cwd = worktree.as_deref();
+    if let Err(err) = spawn_tmux_session(&tmux_name, tmux_cwd) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": err.to_string()})),
@@ -528,7 +571,7 @@ async fn create_agent(
         model: req.model,
         status: "idle".to_string(),
         tmux_session_name: Some(tmux_name),
-        worktree: None,
+        worktree,
     };
     store.agents.insert(id.clone(), agent.clone());
     if let Err(err) = append_store_event(&state.store_path, StoreEvent::AgentUpsert(agent.clone())) {
@@ -1431,6 +1474,30 @@ mod tests {
         let calls = parse_tool_calls("hello there");
         assert!(calls.is_empty());
     }
+
+    #[test]
+    fn resolve_worktree_mode_auto_inherit() {
+        let mode = resolve_worktree_mode(Some("auto"), None, Some("/tmp/wt")).unwrap();
+        match mode {
+            WorktreeMode::Inherit => {}
+            _ => panic!("expected inherit"),
+        }
+    }
+
+    #[test]
+    fn resolve_worktree_mode_new_requires_repo() {
+        let err = resolve_worktree_mode(Some("new"), None, None).unwrap_err();
+        assert!(err.contains("repo_path"));
+    }
+
+    #[test]
+    fn resolve_worktree_mode_auto_new() {
+        let mode = resolve_worktree_mode(Some("auto"), Some("/tmp/repo"), None).unwrap();
+        match mode {
+            WorktreeMode::New(path) => assert_eq!(path, "/tmp/repo"),
+            _ => panic!("expected new"),
+        }
+    }
 }
 
 fn run_fs_read(args: Value) -> Result<Value, (StatusCode, Value)> {
@@ -1653,13 +1720,13 @@ fn append_store_event(path: &Path, event: StoreEvent) -> Result<(), std::io::Err
     append_jsonl(path, &serde_json::to_value(event).unwrap_or_else(|_| json!({})))
 }
 
-fn spawn_tmux_session(name: &str) -> Result<(), std::io::Error> {
-    let status = std::process::Command::new("tmux")
-        .arg("new-session")
-        .arg("-d")
-        .arg("-s")
-        .arg(name)
-        .status()?;
+fn spawn_tmux_session(name: &str, cwd: Option<&str>) -> Result<(), std::io::Error> {
+    let mut cmd = std::process::Command::new("tmux");
+    cmd.arg("new-session").arg("-d").arg("-s").arg(name);
+    if let Some(path) = cwd {
+        cmd.arg("-c").arg(path);
+    }
+    let status = cmd.status()?;
     if !status.success() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::Other,
@@ -1667,4 +1734,89 @@ fn spawn_tmux_session(name: &str) -> Result<(), std::io::Error> {
         ));
     }
     Ok(())
+}
+
+#[derive(Debug)]
+enum WorktreeMode {
+    None,
+    Inherit,
+    New(String),
+}
+
+fn resolve_worktree_mode(
+    mode: Option<&str>,
+    repo_path: Option<&str>,
+    parent_worktree: Option<&str>,
+) -> Result<WorktreeMode, String> {
+    let mode = mode.unwrap_or("auto").to_lowercase();
+    match mode.as_str() {
+        "none" => Ok(WorktreeMode::None),
+        "inherit" => {
+            if parent_worktree.is_some() {
+                Ok(WorktreeMode::Inherit)
+            } else {
+                Err("parent worktree not found".to_string())
+            }
+        }
+        "new" => {
+            let repo_path = repo_path.ok_or_else(|| "repo_path is required for new worktree".to_string())?;
+            Ok(WorktreeMode::New(repo_path.to_string()))
+        }
+        "auto" => {
+            if let Some(repo_path) = repo_path {
+                Ok(WorktreeMode::New(repo_path.to_string()))
+            } else if parent_worktree.is_some() {
+                Ok(WorktreeMode::Inherit)
+            } else {
+                Ok(WorktreeMode::None)
+            }
+        }
+        _ => Err("invalid worktree_mode (use auto|new|inherit|none)".to_string()),
+    }
+}
+
+fn create_worktree(
+    cfg: &Config,
+    session_id: &str,
+    agent_id: &str,
+    repo_path: &str,
+) -> Result<String, String> {
+    let repo_root = git_repo_root(repo_path)?;
+    let base = resolve_path(&cfg.logging.dir)
+        .join("worktrees")
+        .join(session_id);
+    fs::create_dir_all(&base).map_err(|e| e.to_string())?;
+    let worktree_path = base.join(agent_id);
+    let branch_name = format!("aish/{agent_id}");
+
+    let status = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&repo_root)
+        .arg("worktree")
+        .arg("add")
+        .arg(&worktree_path)
+        .arg("-b")
+        .arg(&branch_name)
+        .status()
+        .map_err(|e| e.to_string())?;
+
+    if !status.success() {
+        return Err(format!("git worktree add failed with status: {status}"));
+    }
+
+    Ok(worktree_path.to_string_lossy().to_string())
+}
+
+fn git_repo_root(path: &str) -> Result<String, String> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .arg("rev-parse")
+        .arg("--show-toplevel")
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).to_string());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
