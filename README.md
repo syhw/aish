@@ -7,6 +7,7 @@ aish is a zsh-compatible shell + daemon that runs inside tmux, logs activity, an
 - **LLM providers**: OpenAI-compatible APIs with profiles + model aliases (Z.ai, Together).
 - **Tool runtime**: `shell`, `fs.read`, `fs.write`, `fs.list` with per-tool approval policy.
 - **Logging**: JSONL event logs, stdin command capture, PTY output capture.
+- **Log index**: SQLite index (`logs.sqlite`) for queryable context across events/input/output/file edits.
 - **Sessions + agents**: in-memory registry with JSONL persistence.
 - **tmux**: per-agent tmux sessions, diagnostics endpoint.
 - **Worktrees**: optional git worktrees per agent (inherit/new/none).
@@ -43,6 +44,12 @@ CLI status and LLM:
 ./target/debug/aish status
 ./target/debug/aish llm "Say hello in one sentence."
 ```
+
+When `AISH_SESSION_ID` is set (inside `aish launch` shell), `aish llm` sends
+`session_id` with `context_mode: "diagnostic"` so prompts like "what did I do
+wrong?" can use indexed session context from `logs.sqlite`.
+Inspect selected context directly (no LLM call) with:
+`GET /v1/logs/context/:session_id?q=what+did+i+do+wrong&max_lines=120`.
 
 Create a session and agent:
 ```bash
@@ -150,6 +157,8 @@ Policies are `allow`, `ask`, or `deny`. More specific keys win (e.g., `fs.read` 
 - `POST /v1/tools/:name/call`
 - `GET /v1/runs`, `GET /v1/runs/:id`, `POST /v1/runs/:id/cancel`
 - `GET /v1/diagnostics/tmux`
+- `POST /v1/logs/ingest/:session_id`
+- `GET /v1/logs/context/:session_id` (debug context bundle)
 
 ## Logs
 Default log dir:
@@ -161,6 +170,7 @@ Contains:
 - `output.log` (PTY output)
 - `stdin.log` (command-level input)
 - `sessions.jsonl` (session/agent/run registry)
+- `logs.sqlite` (query index for events, command input, pane output, and file edits)
 
 ## Integration Tests
 See `INTEGRATION_TESTS.md` and `scripts/run_integration_tests.sh`.

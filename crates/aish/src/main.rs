@@ -1,13 +1,13 @@
+use aish_core::config::{self, Config};
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use aish_core::config::{self, Config};
+use serde_json::{json, Map, Value};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread::sleep;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use serde_json::{json, Map, Value};
 
 #[derive(Parser)]
 #[command(name = "aish", version, about = "AI SHell launcher")]
@@ -347,8 +347,7 @@ fn write_log_event_value(
     log_dir: Option<String>,
     actor: Option<String>,
 ) -> Result<()> {
-    let (session_id, log_dir, actor) =
-        resolve_session_and_dir(cfg, session, log_dir, actor)?;
+    let (session_id, log_dir, actor) = resolve_session_and_dir(cfg, session, log_dir, actor)?;
 
     let event = json!({
         "ts_ms": now_ms(),
@@ -361,7 +360,17 @@ fn write_log_event_value(
 
     let events_path = log_dir.join("events.jsonl");
     append_jsonl(&events_path, &event)?;
+    trigger_log_ingest(cfg, &session_id);
     Ok(())
+}
+
+fn trigger_log_ingest(cfg: &Config, session_id: &str) {
+    let base_url = format!("http://{}:{}", cfg.server.hostname, cfg.server.port);
+    let url = format!("{base_url}/v1/logs/ingest/{session_id}");
+    let agent = ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(2))
+        .build();
+    let _ = agent.post(&url).call();
 }
 
 fn resolve_session_and_dir(
@@ -600,6 +609,12 @@ fn run_llm(
     let mut body = json!({
         "prompt": prompt,
     });
+    if let Ok(session_id) = env::var("AISH_SESSION_ID") {
+        if !session_id.trim().is_empty() {
+            body["session_id"] = json!(session_id);
+            body["context_mode"] = json!("diagnostic");
+        }
+    }
     if let Some(provider) = provider.clone() {
         body["provider"] = json!(provider);
     }

@@ -1,15 +1,17 @@
+use aish_core::config::{self, Config, OpenAICompatConfig};
 use anyhow::{bail, Result};
+use axum::http::StatusCode;
+use axum::response::sse::{Event, Sse};
+use axum::response::{IntoResponse, Response};
 use axum::{
     extract::Path as AxumPath,
+    extract::Query,
     extract::State,
     routing::{get, post},
     Json, Router,
 };
-use axum::http::StatusCode;
-use axum::response::{IntoResponse, Response};
-use axum::response::sse::{Event, Sse};
+use chrono::Utc;
 use clap::Parser;
-use aish_core::config::{self, Config, OpenAICompatConfig};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -23,7 +25,8 @@ use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
-use chrono::Utc;
+
+mod log_index;
 
 #[derive(Parser)]
 #[command(name = "aishd", version, about = "aish server daemon")]
@@ -50,12 +53,25 @@ async fn main() -> Result<()> {
     let listener = TcpListener::bind(&addr).await?;
     println!("aishd listening on http://{addr}");
 
-    let store_path = resolve_path(&cfg.logging.dir).join("sessions.jsonl");
+    let log_root = resolve_path(&cfg.logging.dir);
+    fs::create_dir_all(&log_root)?;
+    let store_path = log_root.join("sessions.jsonl");
+    let log_index_path = log_root.join("logs.sqlite");
+    if let Err(err) = log_index::init(&log_index_path) {
+        eprintln!("log index init failed: {err}");
+    }
+    if let Err(err) = log_index::ingest_all(&log_root, &log_index_path) {
+        eprintln!("log index backfill failed: {err}");
+    }
+
     let store = load_store(&store_path).unwrap_or_default();
+    index_store_snapshot(&log_index_path, &store);
     let state = AppState {
         cfg,
         store: std::sync::Arc::new(std::sync::Mutex::new(store)),
         store_path,
+        log_root,
+        log_index_path,
         run_cancels: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
     };
 
@@ -65,7 +81,10 @@ async fn main() -> Result<()> {
         .route("/v1/completions", post(completions))
         .route("/v1/sessions", get(list_sessions).post(create_session))
         .route("/v1/sessions/:id", get(get_session).patch(patch_session))
-        .route("/v1/sessions/:id/agents", get(list_agents).post(create_agent))
+        .route(
+            "/v1/sessions/:id/agents",
+            get(list_agents).post(create_agent),
+        )
         .route("/v1/agents/:id/run", post(run_agent))
         .route("/v1/agents/:id/run/stream", post(run_agent_stream))
         .route("/v1/agents/:id/subagents", post(subagents))
@@ -77,6 +96,8 @@ async fn main() -> Result<()> {
         .route("/v1/diagnostics/tmux", get(diagnostics_tmux))
         .route("/v1/tools", get(list_tools))
         .route("/v1/tools/:name/call", post(call_tool))
+        .route("/v1/logs/ingest/:session_id", post(ingest_logs_session))
+        .route("/v1/logs/context/:session_id", get(get_logs_context))
         .with_state(state);
 
     axum::serve(listener, app).await?;
@@ -123,6 +144,8 @@ async fn version() -> Json<Version> {
 struct CompletionRequest {
     prompt: Option<String>,
     messages: Option<Vec<ChatMessage>>,
+    session_id: Option<String>,
+    context_mode: Option<String>,
     model: Option<String>,
     provider: Option<String>,
     max_tokens: Option<u32>,
@@ -165,6 +188,8 @@ struct AppState {
     cfg: Config,
     store: std::sync::Arc<std::sync::Mutex<Store>>,
     store_path: PathBuf,
+    log_root: PathBuf,
+    log_index_path: PathBuf,
     run_cancels: Arc<std::sync::Mutex<BTreeMap<String, Arc<AtomicBool>>>>,
 }
 
@@ -229,6 +254,9 @@ async fn completions(
     State(state): State<AppState>,
     Json(req): Json<CompletionRequest>,
 ) -> Response {
+    let mut req = req;
+    maybe_inject_completion_context(&state, &mut req);
+
     let cfg = &state.cfg;
     let mut model = req.model.clone().unwrap_or_default();
     let mut provider_name = req.provider.clone();
@@ -271,10 +299,9 @@ async fn completions(
         Err(resp) => return resp,
     };
     let provider = provider.clone();
-    let result =
-        tokio::task::spawn_blocking(move || {
-            call_openai_compat_completions(&provider, &api_key, &model, &req)
-        })
+    let result = tokio::task::spawn_blocking(move || {
+        call_openai_compat_completions(&provider, &api_key, &model, &req)
+    })
     .await;
 
     match result {
@@ -289,6 +316,105 @@ async fn completions(
         )
             .into_response(),
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ContextMode {
+    Off,
+    Diagnostic,
+    Always,
+}
+
+fn parse_context_mode(value: Option<&str>) -> ContextMode {
+    match value.unwrap_or("off").trim().to_lowercase().as_str() {
+        "always" => ContextMode::Always,
+        "diagnostic" => ContextMode::Diagnostic,
+        _ => ContextMode::Off,
+    }
+}
+
+fn maybe_inject_completion_context(state: &AppState, req: &mut CompletionRequest) {
+    let mode = parse_context_mode(req.context_mode.as_deref());
+    if mode == ContextMode::Off {
+        return;
+    }
+    let session_id = match req.session_id.as_deref() {
+        Some(id) => id,
+        None => return,
+    };
+    let query = completion_query_text(req);
+    if query.trim().is_empty() {
+        return;
+    }
+    if mode == ContextMode::Diagnostic && !is_diagnostic_query(&query) {
+        return;
+    }
+
+    let context =
+        match log_index::build_relevant_context(&state.log_index_path, session_id, &query, 120) {
+            Ok(text) if !text.trim().is_empty() => text,
+            _ => return,
+        };
+
+    let system_msg = ChatMessage {
+        role: "system".to_string(),
+        content: format!(
+            "Use this indexed shell/agent execution context when answering.\n\
+             Prefer evidence from context and mention uncertainty when context is insufficient.\n\n{}",
+            context
+        ),
+    };
+
+    if let Some(messages) = req.messages.as_mut() {
+        messages.insert(0, system_msg);
+        return;
+    }
+
+    if let Some(prompt) = req.prompt.as_mut() {
+        *prompt = format!(
+            "Execution context:\n{}\n\nUser request:\n{}",
+            context, prompt
+        );
+    }
+}
+
+fn completion_query_text(req: &CompletionRequest) -> String {
+    if let Some(prompt) = req.prompt.as_ref() {
+        return prompt.clone();
+    }
+    if let Some(messages) = req.messages.as_ref() {
+        for msg in messages.iter().rev() {
+            if msg.role == "user" {
+                return msg.content.clone();
+            }
+        }
+        if let Some(last) = messages.last() {
+            return last.content.clone();
+        }
+    }
+    String::new()
+}
+
+fn is_diagnostic_query(text: &str) -> bool {
+    let lowered = text.to_lowercase();
+    [
+        "what did i do wrong",
+        "what went wrong",
+        "why did",
+        "error",
+        "errors",
+        "failed",
+        "failure",
+        "issue",
+        "problem",
+        "debug",
+        "fix this",
+        "stderr",
+        "panic",
+        "traceback",
+    ]
+    .iter()
+    .any(|needle| lowered.contains(needle))
 }
 
 async fn list_tools(State(state): State<AppState>) -> impl IntoResponse {
@@ -450,13 +576,22 @@ async fn create_session(
         )
             .into_response();
     }
+    if let Err(err) = log_index::upsert_session(
+        &state.log_index_path,
+        &session.id,
+        &session.title,
+        &session.status,
+        &session.share_state,
+        session.tmux_session_name.as_deref(),
+        session.created_at,
+        session.updated_at,
+    ) {
+        eprintln!("log index session upsert failed: {err}");
+    }
     (StatusCode::OK, Json(session)).into_response()
 }
 
-async fn get_session(
-    State(state): State<AppState>,
-    AxumPath(id): AxumPath<String>,
-) -> Response {
+async fn get_session(State(state): State<AppState>, AxumPath(id): AxumPath<String>) -> Response {
     let store = state.store.lock().unwrap();
     match store.sessions.get(&id) {
         Some(session) => (StatusCode::OK, Json(session)).into_response(),
@@ -502,20 +637,32 @@ async fn patch_session(
     }
     session.updated_at = now_ms();
     let updated = session.clone();
-    if let Err(err) = append_store_event(&state.store_path, StoreEvent::SessionUpsert(updated.clone())) {
+    if let Err(err) = append_store_event(
+        &state.store_path,
+        StoreEvent::SessionUpsert(updated.clone()),
+    ) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": err.to_string()})),
         )
             .into_response();
     }
+    if let Err(err) = log_index::upsert_session(
+        &state.log_index_path,
+        &updated.id,
+        &updated.title,
+        &updated.status,
+        &updated.share_state,
+        updated.tmux_session_name.as_deref(),
+        updated.created_at,
+        updated.updated_at,
+    ) {
+        eprintln!("log index session upsert failed: {err}");
+    }
     (StatusCode::OK, Json(updated)).into_response()
 }
 
-async fn list_agents(
-    State(state): State<AppState>,
-    AxumPath(id): AxumPath<String>,
-) -> Response {
+async fn list_agents(State(state): State<AppState>, AxumPath(id): AxumPath<String>) -> Response {
     let store = state.store.lock().unwrap();
     let agents = store
         .agents
@@ -532,10 +679,7 @@ async fn list_runs(State(state): State<AppState>) -> Response {
     (StatusCode::OK, Json(runs)).into_response()
 }
 
-async fn get_run(
-    State(state): State<AppState>,
-    AxumPath(id): AxumPath<String>,
-) -> Response {
+async fn get_run(State(state): State<AppState>, AxumPath(id): AxumPath<String>) -> Response {
     let store = state.store.lock().unwrap();
     match store.runs.get(&id) {
         Some(run) => (StatusCode::OK, Json(run)).into_response(),
@@ -547,10 +691,7 @@ async fn get_run(
     }
 }
 
-async fn cancel_run(
-    State(state): State<AppState>,
-    AxumPath(id): AxumPath<String>,
-) -> Response {
+async fn cancel_run(State(state): State<AppState>, AxumPath(id): AxumPath<String>) -> Response {
     let cancel = {
         let mut cancels = state.run_cancels.lock().unwrap();
         cancels
@@ -560,6 +701,88 @@ async fn cancel_run(
     };
     cancel.store(true, Ordering::SeqCst);
     (StatusCode::OK, Json(json!({"ok": true}))).into_response()
+}
+
+#[derive(Debug, Serialize)]
+struct IngestLogsResponse {
+    session_id: String,
+    events_inserted: u64,
+    stdin_lines_inserted: u64,
+    output_lines_inserted: u64,
+    file_edits_inserted: u64,
+}
+
+async fn ingest_logs_session(
+    State(state): State<AppState>,
+    AxumPath(session_id): AxumPath<String>,
+) -> Response {
+    let log_root = state.log_root.clone();
+    let log_index_path = state.log_index_path.clone();
+    let session_for_task = session_id.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        log_index::ingest_session(&log_root, &log_index_path, &session_for_task)
+    })
+    .await;
+
+    match result {
+        Ok(Ok(stats)) => (
+            StatusCode::OK,
+            Json(IngestLogsResponse {
+                session_id,
+                events_inserted: stats.events_inserted,
+                stdin_lines_inserted: stats.stdin_lines_inserted,
+                output_lines_inserted: stats.output_lines_inserted,
+                file_edits_inserted: stats.file_edits_inserted,
+            }),
+        )
+            .into_response(),
+        Ok(Err(err)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": err})),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("join error: {err}")})),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ContextDebugQuery {
+    q: Option<String>,
+    query: Option<String>,
+    max_lines: Option<usize>,
+}
+
+async fn get_logs_context(
+    State(state): State<AppState>,
+    AxumPath(session_id): AxumPath<String>,
+    Query(params): Query<ContextDebugQuery>,
+) -> Response {
+    let query_text = params
+        .query
+        .or(params.q)
+        .unwrap_or_else(|| "what did I do wrong?".to_string());
+    let max_lines = params.max_lines.unwrap_or(120).clamp(20, 400);
+
+    match log_index::build_relevant_context_bundle(
+        &state.log_index_path,
+        &session_id,
+        &query_text,
+        max_lines,
+    ) {
+        Ok(bundle) => (StatusCode::OK, Json(bundle)).into_response(),
+        Err(err) => {
+            let code = if err.contains("invalid session_id") {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            (code, Json(json!({"error": err}))).into_response()
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -610,28 +833,19 @@ fn create_agent_internal(
         Ok(mode) => match mode {
             WorktreeMode::None => None,
             WorktreeMode::Inherit => parent_worktree.clone(),
-            WorktreeMode::New(repo_path) => match create_worktree(
-                &state.cfg,
-                session_id,
-                &id,
-                &repo_path,
-            ) {
-                Ok(path) => Some(path),
-                Err(err) => {
-                    return Err((
-                        StatusCode::BAD_REQUEST,
-                        Json(json!({"error": err})),
-                    )
-                        .into_response());
+            WorktreeMode::New(repo_path) => {
+                match create_worktree(&state.cfg, session_id, &id, &repo_path) {
+                    Ok(path) => Some(path),
+                    Err(err) => {
+                        return Err(
+                            (StatusCode::BAD_REQUEST, Json(json!({"error": err}))).into_response()
+                        );
+                    }
                 }
-            },
+            }
         },
         Err(err) => {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error": err})),
-            )
-                .into_response());
+            return Err((StatusCode::BAD_REQUEST, Json(json!({"error": err}))).into_response());
         }
     };
 
@@ -655,12 +869,26 @@ fn create_agent_internal(
         worktree,
     };
     store.agents.insert(id.clone(), agent.clone());
-    if let Err(err) = append_store_event(&state.store_path, StoreEvent::AgentUpsert(agent.clone())) {
+    if let Err(err) = append_store_event(&state.store_path, StoreEvent::AgentUpsert(agent.clone()))
+    {
         return Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": err.to_string()})),
         )
             .into_response());
+    }
+    if let Err(err) = log_index::upsert_agent(
+        &state.log_index_path,
+        &agent.id,
+        &agent.session_id,
+        agent.parent_agent_id.as_deref(),
+        agent.model.as_deref(),
+        &agent.status,
+        agent.tmux_session_name.as_deref(),
+        agent.worktree.as_deref(),
+        now_ms(),
+    ) {
+        eprintln!("log index agent upsert failed: {err}");
     }
     Ok(agent)
 }
@@ -680,6 +908,18 @@ fn create_run(state: &AppState, session_id: &str, agent_id: &str, mode: &str) ->
     };
     store.runs.insert(id.clone(), run.clone());
     let _ = append_store_event(&state.store_path, StoreEvent::RunUpsert(run.clone()));
+    if let Err(err) = log_index::upsert_run(
+        &state.log_index_path,
+        &run.id,
+        &run.session_id,
+        &run.agent_id,
+        &run.mode,
+        &run.status,
+        run.started_at,
+        run.ended_at,
+    ) {
+        eprintln!("log index run upsert failed: {err}");
+    }
     run
 }
 
@@ -692,6 +932,18 @@ fn update_run_status(state: &AppState, run_id: &str, status: &str) {
         }
         let updated = run.clone();
         let _ = append_store_event(&state.store_path, StoreEvent::RunUpsert(updated));
+        if let Err(err) = log_index::upsert_run(
+            &state.log_index_path,
+            &run.id,
+            &run.session_id,
+            &run.agent_id,
+            &run.mode,
+            &run.status,
+            run.started_at,
+            run.ended_at,
+        ) {
+            eprintln!("log index run upsert failed: {err}");
+        }
     }
 }
 
@@ -881,11 +1133,7 @@ async fn subagents(
         } else {
             None
         };
-        return (
-            StatusCode::OK,
-            Json(SubagentsResponse { results, summary }),
-        )
-            .into_response();
+        return (StatusCode::OK, Json(SubagentsResponse { results, summary })).into_response();
     }
 
     let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(max_concurrency));
@@ -929,11 +1177,7 @@ async fn subagents(
         None
     };
 
-    (
-        StatusCode::OK,
-        Json(SubagentsResponse { results, summary }),
-    )
-        .into_response()
+    (StatusCode::OK, Json(SubagentsResponse { results, summary })).into_response()
 }
 
 async fn run_subagent_task(
@@ -1076,7 +1320,14 @@ async fn run_flow(
     };
     update_run_status(&state, &run.id, "completed");
 
-    (StatusCode::OK, Json(FlowResponse { status: "completed".to_string(), outputs, run_id: Some(run.id) }))
+    (
+        StatusCode::OK,
+        Json(FlowResponse {
+            status: "completed".to_string(),
+            outputs,
+            run_id: Some(run.id),
+        }),
+    )
         .into_response()
 }
 
@@ -1225,7 +1476,12 @@ async fn run_agent_stream(
             match result {
                 Ok(resp) => {
                     update_run_status(&state, &run.id, &resp.status);
-                    let _ = ctx.emit("run.end", json!({"status": resp.status, "steps": resp.steps})).await;
+                    let _ = ctx
+                        .emit(
+                            "run.end",
+                            json!({"status": resp.status, "steps": resp.steps}),
+                        )
+                        .await;
                 }
                 Err(_) => {
                     update_run_status(&state, &run.id, "error");
@@ -1272,6 +1528,19 @@ async fn run_agent_internal(
             )
                 .into_response());
         }
+        if let Err(err) = log_index::upsert_agent(
+            &state.log_index_path,
+            &updated.id,
+            &updated.session_id,
+            updated.parent_agent_id.as_deref(),
+            updated.model.as_deref(),
+            &updated.status,
+            updated.tmux_session_name.as_deref(),
+            updated.worktree.as_deref(),
+            now_ms(),
+        ) {
+            eprintln!("log index agent upsert failed: {err}");
+        }
         (agent.session_id.clone(), agent.model.clone())
     };
 
@@ -1297,7 +1566,9 @@ async fn run_agent_internal(
     let mut output: Option<String> = None;
     let mut pending: Option<ToolCall> = None;
 
-    ctx.emit("run.start", json!({"steps": max_steps})).await.ok();
+    ctx.emit("run.start", json!({"steps": max_steps}))
+        .await
+        .ok();
 
     while steps < max_steps {
         if ctx.cancel.load(Ordering::SeqCst) {
@@ -1323,28 +1594,15 @@ async fn run_agent_internal(
         )
         .map_err(|err| {
             set_agent_status(state, agent_id, "error");
-            (
-                StatusCode::BAD_GATEWAY,
-                Json(json!({"error": err})),
-            )
-                .into_response()
+            (StatusCode::BAD_GATEWAY, Json(json!({"error": err}))).into_response()
         })?;
 
         ctx.emit("message.start", json!({"step": steps})).await.ok();
-        let completion = call_llm_with_messages(
-            &state.cfg,
-            provider.clone(),
-            model.clone(),
-            &view,
-        )
-        .map_err(|err| {
-            set_agent_status(state, agent_id, "error");
-            (
-                StatusCode::BAD_GATEWAY,
-                Json(json!({"error": err})),
-            )
-                .into_response()
-        })?;
+        let completion = call_llm_with_messages(&state.cfg, provider.clone(), model.clone(), &view)
+            .map_err(|err| {
+                set_agent_status(state, agent_id, "error");
+                (StatusCode::BAD_GATEWAY, Json(json!({"error": err}))).into_response()
+            })?;
 
         messages.push(ChatMessage {
             role: "assistant".to_string(),
@@ -1370,7 +1628,9 @@ async fn run_agent_internal(
                 }
             }
 
-            ctx.emit("tool.start", json!({"tool": call.tool})).await.ok();
+            ctx.emit("tool.start", json!({"tool": call.tool}))
+                .await
+                .ok();
             match execute_tool(
                 &state.cfg,
                 &call.tool,
@@ -1387,15 +1647,24 @@ async fn run_agent_internal(
                         role: "user".to_string(),
                         content: format!("Tool result for {}:\n{}", call.tool, result),
                     });
-                    ctx.emit("tool.end", json!({"tool": call.tool, "ok": true})).await.ok();
+                    ctx.emit("tool.end", json!({"tool": call.tool, "ok": true}))
+                        .await
+                        .ok();
                 }
                 Err(ToolExecError::ApprovalRequired) => {
-                    ctx.emit("tool.end", json!({"tool": call.tool, "ok": false, "error": "approval_required"})).await.ok();
+                    ctx.emit(
+                        "tool.end",
+                        json!({"tool": call.tool, "ok": false, "error": "approval_required"}),
+                    )
+                    .await
+                    .ok();
                     pending = Some(call);
                     break;
                 }
                 Err(ToolExecError::Failed(status, err)) => {
-                    ctx.emit("tool.end", json!({"tool": call.tool, "ok": false})).await.ok();
+                    ctx.emit("tool.end", json!({"tool": call.tool, "ok": false}))
+                        .await
+                        .ok();
                     set_agent_status(state, agent_id, "error");
                     return Err((status, Json(err)).into_response());
                 }
@@ -1498,11 +1767,7 @@ async fn diagnostics_tmux() -> Response {
         detail: kill_result.err().unwrap_or_else(|| "ok".to_string()),
     });
 
-    (
-        StatusCode::OK,
-        Json(DiagnosticReport { ok, steps }),
-    )
-        .into_response()
+    (StatusCode::OK, Json(DiagnosticReport { ok, steps })).into_response()
 }
 
 fn call_openai_compat_completions(
@@ -1594,17 +1859,13 @@ fn resolve_provider<'a>(
 ) -> Result<&'a OpenAICompatConfig, Response> {
     if let Some(name) = provider_name {
         if name == "default" {
-            return cfg
-                .providers
-                .openai_compat
-                .as_ref()
-                .ok_or_else(|| {
-                    (
-                        StatusCode::BAD_REQUEST,
-                        Json(json!({"error": "default provider not configured"})),
-                    )
-                        .into_response()
-                });
+            return cfg.providers.openai_compat.as_ref().ok_or_else(|| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": "default provider not configured"})),
+                )
+                    .into_response()
+            });
         }
         return cfg
             .providers
@@ -1619,16 +1880,13 @@ fn resolve_provider<'a>(
             });
     }
 
-    cfg.providers
-        .openai_compat
-        .as_ref()
-        .ok_or_else(|| {
-            (
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error": "openai_compat provider not configured"})),
-            )
-                .into_response()
-        })
+    cfg.providers.openai_compat.as_ref().ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "openai_compat provider not configured"})),
+        )
+            .into_response()
+    })
 }
 
 fn resolve_api_key(
@@ -1686,6 +1944,8 @@ fn call_llm_with_messages(
     let req = CompletionRequest {
         prompt: None,
         messages: Some(messages.to_vec()),
+        session_id: None,
+        context_mode: None,
         model: Some(model.clone()),
         provider: provider_name,
         max_tokens: None,
@@ -1695,8 +1955,7 @@ fn call_llm_with_messages(
     };
     let response = call_openai_compat_completions(provider, &api_key, &model, &req)
         .map_err(|(_, err)| err.to_string())?;
-    extract_completion_text(&response)
-        .ok_or_else(|| "no completion text returned".to_string())
+    extract_completion_text(&response).ok_or_else(|| "no completion text returned".to_string())
 }
 
 fn apply_context_editing(
@@ -1818,7 +2077,10 @@ fn aggregate_subagent_results(
             "Agent {} status={}:\n{}\n\n",
             result.agent_id,
             result.status,
-            result.output.clone().unwrap_or_else(|| "<no output>".to_string())
+            result
+                .output
+                .clone()
+                .unwrap_or_else(|| "<no output>".to_string())
         ));
     }
     let user_prompt = prompt.unwrap_or_else(|| "Aggregate the following subagent outputs into a concise synthesis with key findings and action items.".to_string());
@@ -2010,11 +2272,7 @@ async fn run_flow_node(
             )
             .map(|text| Value::String(text))
             .map_err(|err| {
-                (
-                    StatusCode::BAD_GATEWAY,
-                    Json(json!({"error": err})),
-                )
-                    .into_response()
+                (StatusCode::BAD_GATEWAY, Json(json!({"error": err}))).into_response()
             })?;
             if let Some(ctx) = &ctx {
                 let _ = ctx
@@ -2065,7 +2323,9 @@ async fn run_flow_node(
                 ToolExecError::Failed(status, value) => (status, Json(value)).into_response(),
             })?;
             if let Some(ctx) = &ctx {
-                let _ = ctx.emit("tool.end", json!({"tool": tool, "ok": true})).await;
+                let _ = ctx
+                    .emit("tool.end", json!({"tool": tool, "ok": true}))
+                    .await;
                 let _ = ctx
                     .emit("flow.node.end", json!({"node": node.id, "ok": true}))
                     .await;
@@ -2073,7 +2333,9 @@ async fn run_flow_node(
             Ok(result)
         }
         "aggregate" => {
-            let mut prompt = node.prompt.unwrap_or_else(|| "Aggregate the following outputs.".to_string());
+            let mut prompt = node
+                .prompt
+                .unwrap_or_else(|| "Aggregate the following outputs.".to_string());
             if let Some(inputs) = node.inputs {
                 for input in inputs {
                     if let Some(value) = outputs.get(&input) {
@@ -2099,11 +2361,7 @@ async fn run_flow_node(
             )
             .map(|text| Value::String(text))
             .map_err(|err| {
-                (
-                    StatusCode::BAD_GATEWAY,
-                    Json(json!({"error": err})),
-                )
-                    .into_response()
+                (StatusCode::BAD_GATEWAY, Json(json!({"error": err}))).into_response()
             })?;
             if let Some(ctx) = &ctx {
                 let _ = ctx
@@ -2134,9 +2392,12 @@ fn render_template(value: Value, outputs: &BTreeMap<String, Value>) -> Value {
             }
             Value::String(out)
         }
-        Value::Array(items) => {
-            Value::Array(items.into_iter().map(|v| render_template(v, outputs)).collect())
-        }
+        Value::Array(items) => Value::Array(
+            items
+                .into_iter()
+                .map(|v| render_template(v, outputs))
+                .collect(),
+        ),
         Value::Object(map) => {
             let mut out = serde_json::Map::new();
             for (k, v) in map {
@@ -2353,6 +2614,19 @@ fn set_agent_status(state: &AppState, agent_id: &str, status: &str) {
         agent.worktree = agent.worktree.clone();
         let updated = agent.clone();
         let _ = append_store_event(&state.store_path, StoreEvent::AgentUpsert(updated));
+        if let Err(err) = log_index::upsert_agent(
+            &state.log_index_path,
+            &agent.id,
+            &agent.session_id,
+            agent.parent_agent_id.as_deref(),
+            agent.model.as_deref(),
+            &agent.status,
+            agent.tmux_session_name.as_deref(),
+            agent.worktree.as_deref(),
+            now_ms(),
+        ) {
+            eprintln!("log index agent upsert failed: {err}");
+        }
     }
 }
 
@@ -2523,9 +2797,12 @@ fn run_shell(args: Value) -> Result<Value, (StatusCode, Value)> {
             cmd.env(key, value);
         }
     }
-    let output = cmd
-        .output()
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, json!({"error": e.to_string()})))?;
+    let output = cmd.output().map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json!({"error": e.to_string()}),
+        )
+    })?;
     Ok(json!({
         "status": output.status.code(),
         "success": output.status.success(),
@@ -2715,8 +2992,12 @@ fn run_fs_read(args: Value) -> Result<Value, (StatusCode, Value)> {
     let args: FsReadArgs = serde_json::from_value(args)
         .map_err(|e| (StatusCode::BAD_REQUEST, json!({"error": e.to_string()})))?;
     let path = Path::new(&args.path);
-    let bytes = fs::read(path)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, json!({"error": e.to_string()})))?;
+    let bytes = fs::read(path).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json!({"error": e.to_string()}),
+        )
+    })?;
     let mut truncated = false;
     let data = if let Some(max) = args.max_bytes {
         if bytes.len() as u64 > max {
@@ -2741,8 +3022,12 @@ fn run_fs_write(args: Value) -> Result<Value, (StatusCode, Value)> {
     let path = Path::new(&args.path);
     if args.create_dirs == Some(true) {
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, json!({"error": e.to_string()})))?;
+            fs::create_dir_all(parent).map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    json!({"error": e.to_string()}),
+                )
+            })?;
         }
     }
     if args.append == Some(true) {
@@ -2751,12 +3036,25 @@ fn run_fs_write(args: Value) -> Result<Value, (StatusCode, Value)> {
             .create(true)
             .append(true)
             .open(path)
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, json!({"error": e.to_string()})))?;
-        file.write_all(args.content.as_bytes())
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, json!({"error": e.to_string()})))?;
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    json!({"error": e.to_string()}),
+                )
+            })?;
+        file.write_all(args.content.as_bytes()).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({"error": e.to_string()}),
+            )
+        })?;
     } else {
-        fs::write(path, args.content)
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, json!({"error": e.to_string()})))?;
+        fs::write(path, args.content).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({"error": e.to_string()}),
+            )
+        })?;
     }
     Ok(json!({ "ok": true, "path": args.path }))
 }
@@ -2765,11 +3063,19 @@ fn run_fs_list(args: Value) -> Result<Value, (StatusCode, Value)> {
     let args: FsListArgs = serde_json::from_value(args)
         .map_err(|e| (StatusCode::BAD_REQUEST, json!({"error": e.to_string()})))?;
     let mut entries = Vec::new();
-    let dir = fs::read_dir(&args.path)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, json!({"error": e.to_string()})))?;
+    let dir = fs::read_dir(&args.path).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json!({"error": e.to_string()}),
+        )
+    })?;
     for entry in dir {
-        let entry = entry
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, json!({"error": e.to_string()})))?;
+        let entry = entry.map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({"error": e.to_string()}),
+            )
+        })?;
         let path = entry.path();
         entries.push(json!({
             "name": entry.file_name().to_string_lossy(),
@@ -2802,6 +3108,10 @@ fn log_tool_event(
     });
     let path = dir.join("events.jsonl");
     append_jsonl(&path, &event)?;
+    let db_path = resolve_path(&cfg.logging.dir).join("logs.sqlite");
+    if let Err(err) = log_index::append_event(&db_path, &event) {
+        eprintln!("log index append failed: {err}");
+    }
     Ok(())
 }
 
@@ -2946,7 +3256,56 @@ fn apply_event(store: &mut Store, event: StoreEvent) {
 }
 
 fn append_store_event(path: &Path, event: StoreEvent) -> Result<(), std::io::Error> {
-    append_jsonl(path, &serde_json::to_value(event).unwrap_or_else(|_| json!({})))
+    append_jsonl(
+        path,
+        &serde_json::to_value(event).unwrap_or_else(|_| json!({})),
+    )
+}
+
+fn index_store_snapshot(db_path: &Path, store: &Store) {
+    for session in store.sessions.values() {
+        if let Err(err) = log_index::upsert_session(
+            db_path,
+            &session.id,
+            &session.title,
+            &session.status,
+            &session.share_state,
+            session.tmux_session_name.as_deref(),
+            session.created_at,
+            session.updated_at,
+        ) {
+            eprintln!("log index session upsert failed: {err}");
+        }
+    }
+    for agent in store.agents.values() {
+        if let Err(err) = log_index::upsert_agent(
+            db_path,
+            &agent.id,
+            &agent.session_id,
+            agent.parent_agent_id.as_deref(),
+            agent.model.as_deref(),
+            &agent.status,
+            agent.tmux_session_name.as_deref(),
+            agent.worktree.as_deref(),
+            now_ms(),
+        ) {
+            eprintln!("log index agent upsert failed: {err}");
+        }
+    }
+    for run in store.runs.values() {
+        if let Err(err) = log_index::upsert_run(
+            db_path,
+            &run.id,
+            &run.session_id,
+            &run.agent_id,
+            &run.mode,
+            &run.status,
+            run.started_at,
+            run.ended_at,
+        ) {
+            eprintln!("log index run upsert failed: {err}");
+        }
+    }
 }
 
 fn spawn_tmux_session(name: &str, cwd: Option<&str>) -> Result<(), std::io::Error> {
@@ -2988,7 +3347,8 @@ fn resolve_worktree_mode(
             }
         }
         "new" => {
-            let repo_path = repo_path.ok_or_else(|| "repo_path is required for new worktree".to_string())?;
+            let repo_path =
+                repo_path.ok_or_else(|| "repo_path is required for new worktree".to_string())?;
             Ok(WorktreeMode::New(repo_path.to_string()))
         }
         "auto" => {
