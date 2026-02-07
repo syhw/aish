@@ -146,6 +146,9 @@ struct CompletionRequest {
     messages: Option<Vec<ChatMessage>>,
     session_id: Option<String>,
     context_mode: Option<String>,
+    context_max_lines: Option<usize>,
+    context_max_chars: Option<usize>,
+    context_output_window: Option<usize>,
     model: Option<String>,
     provider: Option<String>,
     max_tokens: Option<u32>,
@@ -350,11 +353,21 @@ fn maybe_inject_completion_context(state: &AppState, req: &mut CompletionRequest
         return;
     }
 
-    let context =
-        match log_index::build_relevant_context(&state.log_index_path, session_id, &query, 120) {
-            Ok(text) if !text.trim().is_empty() => text,
-            _ => return,
-        };
+    let options = log_index::BuildContextOptions {
+        max_lines: req.context_max_lines.unwrap_or(120).clamp(40, 300),
+        max_chars: req.context_max_chars.unwrap_or(4500).clamp(120, 12000),
+        output_window: req.context_output_window.unwrap_or(1).clamp(0, 5),
+        ..log_index::BuildContextOptions::default()
+    };
+    let context = match log_index::build_relevant_context_bundle_with_options(
+        &state.log_index_path,
+        session_id,
+        &query,
+        options,
+    ) {
+        Ok(bundle) if !bundle.context_text.trim().is_empty() => bundle.context_text,
+        _ => return,
+    };
 
     let system_msg = ChatMessage {
         role: "system".to_string(),
@@ -754,6 +767,8 @@ struct ContextDebugQuery {
     q: Option<String>,
     query: Option<String>,
     max_lines: Option<usize>,
+    max_chars: Option<usize>,
+    output_window: Option<usize>,
 }
 
 async fn get_logs_context(
@@ -765,13 +780,18 @@ async fn get_logs_context(
         .query
         .or(params.q)
         .unwrap_or_else(|| "what did I do wrong?".to_string());
-    let max_lines = params.max_lines.unwrap_or(120).clamp(20, 400);
+    let options = log_index::BuildContextOptions {
+        max_lines: params.max_lines.unwrap_or(120).clamp(20, 400),
+        max_chars: params.max_chars.unwrap_or(4500).clamp(120, 20000),
+        output_window: params.output_window.unwrap_or(1).clamp(0, 5),
+        ..log_index::BuildContextOptions::default()
+    };
 
-    match log_index::build_relevant_context_bundle(
+    match log_index::build_relevant_context_bundle_with_options(
         &state.log_index_path,
         &session_id,
         &query_text,
-        max_lines,
+        options,
     ) {
         Ok(bundle) => (StatusCode::OK, Json(bundle)).into_response(),
         Err(err) => {
@@ -1946,6 +1966,9 @@ fn call_llm_with_messages(
         messages: Some(messages.to_vec()),
         session_id: None,
         context_mode: None,
+        context_max_lines: None,
+        context_max_chars: None,
+        context_output_window: None,
         model: Some(model.clone()),
         provider: provider_name,
         max_tokens: None,

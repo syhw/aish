@@ -50,6 +50,9 @@ When `AISH_SESSION_ID` is set (inside `aish launch` shell), `aish llm` sends
 wrong?" can use indexed session context from `logs.sqlite`.
 Inspect selected context directly (no LLM call) with:
 `GET /v1/logs/context/:session_id?q=what+did+i+do+wrong&max_lines=120`.
+The response includes `selected_evidence` items with categories, scores, and reasons.
+You can tune context packing with `max_chars` and local output expansion with
+`output_window` (0-5).
 
 Create a session and agent:
 ```bash
@@ -177,4 +180,14 @@ See `INTEGRATION_TESTS.md` and `scripts/run_integration_tests.sh`.
 Run:
 ```bash
 AISHD_URL=http://127.0.0.1:5033 scripts/run_integration_tests.sh
+```
+
+## Relevance Eval Harness
+Evaluate retrieval relevance for `/v1/logs/context` against predefined cases:
+```bash
+AISHD_URL=http://127.0.0.1:5033 python3 scripts/relevance_eval.py
+```
+Use a custom case file:
+```bash
+python3 scripts/relevance_eval.py --cases scripts/relevance_eval_cases.json
 ```

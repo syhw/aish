@@ -1,0 +1,143 @@
+[
+  {
+    "name": "command-failure-with-stderr",
+    "query": "what did i do wrong with cargo test?",
+    "options": {
+      "max_lines": 120,
+      "max_chars": 3500,
+      "output_window": 1
+    },
+    "logs": {
+      "events": [
+        {
+          "kind": "command.start",
+          "data": {
+            "cmd": "cargo test"
+          }
+        },
+        {
+          "kind": "command.end",
+          "data": {
+            "exit": 101
+          }
+        },
+        {
+          "kind": "tool.end",
+          "data": {
+            "tool": "shell",
+            "ok": false,
+            "error": "build failed"
+          }
+        }
+      ],
+      "stdin": [
+        "cargo test",
+        "git status"
+      ],
+      "stderr": [
+        "error[E0425]: cannot find value `foo` in this scope",
+        "thread 'main' panicked at src/lib.rs:10:1"
+      ]
+    },
+    "expect": {
+      "must_contain": [
+        "cargo test -> exit 101",
+        "error[E0425]",
+        "build failed"
+      ],
+      "must_have_categories": [
+        "failure.command",
+        "output"
+      ],
+      "min_evidence": 3,
+      "max_context_chars": 3500
+    }
+  },
+  {
+    "name": "edit-focused-query",
+    "query": "which files did i edit",
+    "options": {
+      "max_lines": 120,
+      "max_chars": 2800,
+      "output_window": 0
+    },
+    "logs": {
+      "events": [
+        {
+          "kind": "tool.start",
+          "data": {
+            "tool": "fs.write",
+            "args": {
+              "path": "src/main.rs",
+              "append": false,
+              "content": "fn main(){}"
+            }
+          }
+        },
+        {
+          "kind": "tool.start",
+          "data": {
+            "tool": "fs.write",
+            "args": {
+              "path": "README.md",
+              "append": true,
+              "content": "notes"
+            }
+          }
+        }
+      ],
+      "stdin": [
+        "llm which files changed"
+      ],
+      "stdout": [
+        "done"
+      ]
+    },
+    "expect": {
+      "must_contain": [
+        "src/main.rs (overwrite)",
+        "README.md (append)"
+      ],
+      "must_have_categories": [
+        "edit"
+      ],
+      "min_evidence": 2,
+      "max_context_chars": 2800
+    }
+  },
+  {
+    "name": "budget-cap-enforced",
+    "query": "why did build fail",
+    "options": {
+      "max_lines": 120,
+      "max_chars": 180,
+      "output_window": 1
+    },
+    "logs": {
+      "events": [
+        {
+          "kind": "command.start",
+          "data": {
+            "cmd": "cargo test --workspace --all-features"
+          }
+        },
+        {
+          "kind": "command.end",
+          "data": {
+            "exit": 101
+          }
+        }
+      ],
+      "stderr": [
+        "error: synthetic long error for budget testing and retrieval truncation"
+      ]
+    },
+    "expect": {
+      "must_have_categories": [
+        "failure.command"
+      ],
+      "min_evidence": 1,
+      "max_context_chars": 180
+    }
+  }
+]

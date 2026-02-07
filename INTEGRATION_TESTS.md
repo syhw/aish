@@ -17,6 +17,11 @@ Automated script:
 AISHD_URL=http://127.0.0.1:5033 scripts/run_integration_tests.sh
 ```
 
+Relevance eval harness:
+```
+AISHD_URL=http://127.0.0.1:5033 python3 scripts/relevance_eval.py
+```
+
 ## Tests (manual description)
 
 ### 1) Health + Version

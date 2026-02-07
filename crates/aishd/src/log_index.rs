@@ -1,7 +1,7 @@
 use rusqlite::{params, Connection};
 use serde::Serialize;
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
@@ -25,7 +25,35 @@ pub struct ContextBundle {
     pub related_commands: Vec<String>,
     pub related_output: Vec<String>,
     pub recent_edits: Vec<String>,
+    pub selected_evidence: Vec<EvidenceItem>,
     pub context_text: String,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct EvidenceItem {
+    pub category: String,
+    pub text: String,
+    pub score: f32,
+    pub reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct BuildContextOptions {
+    pub max_lines: usize,
+    pub max_chars: usize,
+    pub output_window: usize,
+    pub max_evidence: usize,
+}
+
+impl Default for BuildContextOptions {
+    fn default() -> Self {
+        Self {
+            max_lines: 120,
+            max_chars: 4500,
+            output_window: 1,
+            max_evidence: 36,
+        }
+    }
 }
 
 impl IngestStats {
@@ -290,21 +318,11 @@ pub fn upsert_run(
     Ok(())
 }
 
-pub fn build_relevant_context(
+pub fn build_relevant_context_bundle_with_options(
     db_path: &Path,
     session_id: &str,
     query: &str,
-    max_lines: usize,
-) -> Result<String, String> {
-    let bundle = build_relevant_context_bundle(db_path, session_id, query, max_lines)?;
-    Ok(bundle.context_text)
-}
-
-pub fn build_relevant_context_bundle(
-    db_path: &Path,
-    session_id: &str,
-    query: &str,
-    max_lines: usize,
+    options: BuildContextOptions,
 ) -> Result<ContextBundle, String> {
     if session_id.contains('/') || session_id.contains('\\') || session_id.contains("..") {
         return Err("invalid session_id".to_string());
@@ -318,11 +336,41 @@ pub fn build_relevant_context_bundle(
     let events = load_events(&conn, session_id, 500)?;
     let edits = load_file_edits(&conn, session_id, 60)?;
 
-    let failing_commands = collect_failing_commands(&events, 12);
-    let failing_tools = collect_failing_tools(&events, 12);
-    let related_commands = collect_related_lines(&commands, &tokens, 15);
-    let related_output = collect_related_output(&outputs, &tokens, 30);
-    let recent_edits = collect_recent_edits(&edits, 12);
+    let command_failures = correlate_command_failures(&events, 24);
+    let tool_failures = correlate_tool_failures(&events, 24);
+
+    let mut candidates = Vec::new();
+    candidates.extend(score_command_failures(&command_failures, &tokens));
+    candidates.extend(score_tool_failures(&tool_failures, &tokens));
+    candidates.extend(score_commands(&commands, &tokens, 40));
+    candidates.extend(score_output(&outputs, &tokens, 80));
+    candidates.extend(score_edits(&edits, &tokens, 30));
+
+    let selected = select_candidates(candidates, options.max_evidence.max(8));
+    let failing_commands = selected_lines_by_category(&selected, "failure.command", 12);
+    let failing_tools = selected_lines_by_category(&selected, "failure.tool", 12);
+    let related_commands = selected_lines_by_category(&selected, "command", 15);
+    let selected_output_ids = selected_output_ids(&selected, 24);
+    let related_output = if selected_output_ids.is_empty() {
+        selected_lines_by_category(&selected, "output", 30)
+    } else {
+        expand_output_windows(
+            &outputs,
+            &selected_output_ids,
+            options.output_window.min(5),
+            30,
+        )
+    };
+    let recent_edits = selected_lines_by_category(&selected, "edit", 12);
+    let selected_evidence = selected
+        .iter()
+        .map(|candidate| EvidenceItem {
+            category: candidate.category.to_string(),
+            text: candidate.text.clone(),
+            score: ((candidate.score * 100.0).round() / 100.0),
+            reasons: candidate.reasons.clone(),
+        })
+        .collect::<Vec<_>>();
 
     let mut bundle = ContextBundle {
         session_id: session_id.to_string(),
@@ -333,13 +381,14 @@ pub fn build_relevant_context_bundle(
         related_commands,
         related_output,
         recent_edits,
+        selected_evidence,
         context_text: String::new(),
     };
-    bundle.context_text = render_context_text(&bundle, max_lines);
+    bundle.context_text = render_context_text(&bundle, options);
     Ok(bundle)
 }
 
-fn render_context_text(bundle: &ContextBundle, max_lines: usize) -> String {
+fn render_context_text(bundle: &ContextBundle, options: BuildContextOptions) -> String {
     let mut lines = Vec::new();
     lines.push(format!("Session: {}", bundle.session_id));
     lines.push(format!("Query: {}", truncate_line(&bundle.query, 220)));
@@ -379,14 +428,495 @@ fn render_context_text(bundle: &ContextBundle, max_lines: usize) -> String {
         }
     }
 
+    if !bundle.selected_evidence.is_empty() {
+        lines.push("Top evidence:".to_string());
+        for item in bundle.selected_evidence.iter().take(8) {
+            lines.push(format!(
+                "- [{} {:.1}] {}",
+                item.category,
+                item.score,
+                truncate_line(&item.text, 200)
+            ));
+        }
+    }
+
     if lines.len() <= 2 {
         lines.push("No relevant indexed shell context was found.".to_string());
     }
 
-    if lines.len() > max_lines {
-        lines.truncate(max_lines);
+    let packed =
+        pack_lines_with_budget(lines, options.max_lines.max(10), options.max_chars.max(120));
+    packed.join("\n")
+}
+
+#[derive(Debug, Clone)]
+struct CommandFailure {
+    text: String,
+    ts_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+struct ToolFailure {
+    text: String,
+    ts_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+struct ScoredCandidate {
+    category: &'static str,
+    text: String,
+    score: f32,
+    output_id: Option<i64>,
+    reasons: Vec<String>,
+}
+
+fn correlate_command_failures(events: &[EventRecord], max: usize) -> Vec<CommandFailure> {
+    let mut pending_cmds: Vec<(String, Option<i64>)> = Vec::new();
+    let mut failures = Vec::new();
+
+    for event in events.iter().rev() {
+        match event.kind.as_str() {
+            "command.start" => {
+                let cmd = event
+                    .data
+                    .get("cmd")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
+                if !cmd.is_empty() {
+                    pending_cmds.push((cmd, event.ts_ms));
+                }
+            }
+            "command.end" => {
+                let exit = event.data.get("exit").and_then(value_to_i64).unwrap_or(0);
+                if exit == 0 {
+                    continue;
+                }
+                let text = if let Some((cmd, _)) = pending_cmds.pop() {
+                    format!("{cmd} -> exit {exit}")
+                } else {
+                    format!("command ended with exit {exit}")
+                };
+                failures.push(CommandFailure {
+                    text,
+                    ts_ms: event.ts_ms,
+                });
+            }
+            _ => {}
+        }
     }
-    lines.join("\n")
+
+    failures.reverse();
+    failures.truncate(max);
+    failures
+}
+
+fn correlate_tool_failures(events: &[EventRecord], max: usize) -> Vec<ToolFailure> {
+    let mut pending_tools: Vec<String> = Vec::new();
+    let mut failures = Vec::new();
+
+    for event in events.iter().rev() {
+        match event.kind.as_str() {
+            "tool.start" => {
+                if let Some(tool) = event.data.get("tool").and_then(|v| v.as_str()) {
+                    pending_tools.push(tool.to_string());
+                }
+            }
+            "tool.end" => {
+                let ok = event
+                    .data
+                    .get("ok")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true);
+                if ok {
+                    continue;
+                }
+                let tool = event
+                    .data
+                    .get("tool")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .or_else(|| pending_tools.pop())
+                    .unwrap_or_else(|| "unknown".to_string());
+                let error = event
+                    .data
+                    .get("error")
+                    .map(value_to_searchable_text)
+                    .unwrap_or_else(|| "unknown error".to_string());
+                failures.push(ToolFailure {
+                    text: format!("{tool} failed: {error}"),
+                    ts_ms: event.ts_ms,
+                });
+            }
+            _ => {}
+        }
+    }
+
+    failures.reverse();
+    failures.truncate(max);
+    failures
+}
+
+fn score_command_failures(failures: &[CommandFailure], tokens: &[String]) -> Vec<ScoredCandidate> {
+    let total = failures.len().max(1) as f32;
+    failures
+        .iter()
+        .enumerate()
+        .map(|(idx, failure)| {
+            let overlap = token_overlap_count(&failure.text, tokens) as f32;
+            let recency = recency_boost(idx, total);
+            ScoredCandidate {
+                category: "failure.command",
+                text: failure.text.clone(),
+                score: 8.0 + overlap * 2.5 + recency,
+                output_id: None,
+                reasons: vec![
+                    "non-zero exit".to_string(),
+                    if overlap > 0.0 {
+                        "query token overlap".to_string()
+                    } else {
+                        "recent failure".to_string()
+                    },
+                    ts_reason(failure.ts_ms),
+                ],
+            }
+        })
+        .collect()
+}
+
+fn score_tool_failures(failures: &[ToolFailure], tokens: &[String]) -> Vec<ScoredCandidate> {
+    let total = failures.len().max(1) as f32;
+    failures
+        .iter()
+        .enumerate()
+        .map(|(idx, failure)| {
+            let overlap = token_overlap_count(&failure.text, tokens) as f32;
+            let recency = recency_boost(idx, total);
+            ScoredCandidate {
+                category: "failure.tool",
+                text: failure.text.clone(),
+                score: 7.0 + overlap * 2.0 + recency,
+                output_id: None,
+                reasons: vec![
+                    "tool failure".to_string(),
+                    if overlap > 0.0 {
+                        "query token overlap".to_string()
+                    } else {
+                        "recent failure".to_string()
+                    },
+                    ts_reason(failure.ts_ms),
+                ],
+            }
+        })
+        .collect()
+}
+
+fn score_commands(lines: &[String], tokens: &[String], max_scan: usize) -> Vec<ScoredCandidate> {
+    let total = max_scan.min(lines.len()).max(1) as f32;
+    lines
+        .iter()
+        .take(max_scan)
+        .enumerate()
+        .filter_map(|(idx, line)| {
+            let text = line.trim();
+            if text.is_empty() {
+                return None;
+            }
+            let overlap = token_overlap_count(text, tokens) as f32;
+            let score = overlap * 2.2 + recency_boost(idx, total) * 0.8;
+            if overlap <= 0.0 && !tokens.is_empty() {
+                return None;
+            }
+            Some(ScoredCandidate {
+                category: "command",
+                text: text.to_string(),
+                score,
+                output_id: None,
+                reasons: vec![if overlap > 0.0 {
+                    "query token overlap".to_string()
+                } else {
+                    "recent command".to_string()
+                }],
+            })
+        })
+        .collect()
+}
+
+fn score_output(
+    lines: &[OutputRecord],
+    tokens: &[String],
+    max_scan: usize,
+) -> Vec<ScoredCandidate> {
+    let total = max_scan.min(lines.len()).max(1) as f32;
+    lines
+        .iter()
+        .take(max_scan)
+        .enumerate()
+        .filter_map(|(idx, rec)| {
+            let text = rec.line_text.trim();
+            if text.is_empty() {
+                return None;
+            }
+            let lowered = text.to_lowercase();
+            let overlap = token_overlap_count(&lowered, tokens) as f32;
+            let has_error = contains_error_signal(&lowered);
+            let stderr_boost = if rec.stream == "stderr" { 2.5 } else { 0.0 };
+            let error_boost = if has_error { 3.0 } else { 0.0 };
+            let score = overlap * 2.0 + stderr_boost + error_boost + recency_boost(idx, total);
+            if score < 2.5 {
+                return None;
+            }
+
+            let mut reasons = Vec::new();
+            if rec.stream == "stderr" {
+                reasons.push("stderr stream".to_string());
+            }
+            if has_error {
+                reasons.push("error signal".to_string());
+            }
+            if overlap > 0.0 {
+                reasons.push("query token overlap".to_string());
+            }
+            if reasons.is_empty() {
+                reasons.push("recent output".to_string());
+            }
+
+            Some(ScoredCandidate {
+                category: "output",
+                text: format!("[{}] {}", rec.stream, text),
+                score,
+                output_id: Some(rec.id),
+                reasons,
+            })
+        })
+        .collect()
+}
+
+fn score_edits(
+    edits: &[FileEditRecord],
+    tokens: &[String],
+    max_scan: usize,
+) -> Vec<ScoredCandidate> {
+    let total = max_scan.min(edits.len()).max(1) as f32;
+    edits
+        .iter()
+        .take(max_scan)
+        .enumerate()
+        .filter_map(|(idx, rec)| {
+            let path = rec.path.as_deref()?.trim();
+            if path.is_empty() {
+                return None;
+            }
+            let mode = rec.write_mode.as_deref().unwrap_or("unknown");
+            let text = format!("{path} ({mode})");
+            let overlap = token_overlap_count(path, tokens) as f32;
+            let score = 1.6 + overlap * 1.8 + recency_boost(idx, total) * 0.5;
+            let reason = if overlap > 0.0 {
+                "query token overlap"
+            } else {
+                "recent edit"
+            };
+            Some(ScoredCandidate {
+                category: "edit",
+                text,
+                score,
+                output_id: None,
+                reasons: vec![reason.to_string()],
+            })
+        })
+        .collect()
+}
+
+fn select_candidates(
+    mut candidates: Vec<ScoredCandidate>,
+    max_total: usize,
+) -> Vec<ScoredCandidate> {
+    candidates.sort_by(|a, b| b.score.total_cmp(&a.score));
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    let mut failure_cmd_count = 0usize;
+    let mut failure_tool_count = 0usize;
+    let mut command_count = 0usize;
+    let mut output_count = 0usize;
+    let mut edit_count = 0usize;
+
+    for candidate in candidates {
+        if !seen.insert(candidate.text.clone()) {
+            continue;
+        }
+        let within_cap = match candidate.category {
+            "failure.command" => {
+                if failure_cmd_count >= 8 {
+                    false
+                } else {
+                    failure_cmd_count += 1;
+                    true
+                }
+            }
+            "failure.tool" => {
+                if failure_tool_count >= 8 {
+                    false
+                } else {
+                    failure_tool_count += 1;
+                    true
+                }
+            }
+            "command" => {
+                if command_count >= 10 {
+                    false
+                } else {
+                    command_count += 1;
+                    true
+                }
+            }
+            "output" => {
+                if output_count >= 16 {
+                    false
+                } else {
+                    output_count += 1;
+                    true
+                }
+            }
+            "edit" => {
+                if edit_count >= 8 {
+                    false
+                } else {
+                    edit_count += 1;
+                    true
+                }
+            }
+            _ => false,
+        };
+        if !within_cap {
+            continue;
+        }
+        out.push(candidate);
+        if out.len() >= max_total {
+            break;
+        }
+    }
+    out
+}
+
+fn selected_lines_by_category(
+    selected: &[ScoredCandidate],
+    category: &str,
+    max: usize,
+) -> Vec<String> {
+    selected
+        .iter()
+        .filter(|item| item.category == category)
+        .take(max)
+        .map(|item| item.text.clone())
+        .collect()
+}
+
+fn selected_output_ids(selected: &[ScoredCandidate], max: usize) -> Vec<i64> {
+    selected
+        .iter()
+        .filter_map(|item| {
+            if item.category == "output" {
+                item.output_id
+            } else {
+                None
+            }
+        })
+        .take(max)
+        .collect()
+}
+
+fn expand_output_windows(
+    lines: &[OutputRecord],
+    selected_ids: &[i64],
+    window: usize,
+    max: usize,
+) -> Vec<String> {
+    let mut by_id = HashMap::new();
+    for (idx, rec) in lines.iter().enumerate() {
+        by_id.insert(rec.id, idx);
+    }
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for id in selected_ids {
+        let Some(&center) = by_id.get(id) else {
+            continue;
+        };
+        let start = center.saturating_sub(window);
+        let end = (center + window).min(lines.len().saturating_sub(1));
+        for idx in start..=end {
+            let rec = &lines[idx];
+            let text = rec.line_text.trim();
+            if text.is_empty() {
+                continue;
+            }
+            let decorated = format!("[{}] {}", rec.stream, text);
+            if seen.insert(decorated.clone()) {
+                out.push(decorated);
+            }
+            if out.len() >= max {
+                return out;
+            }
+        }
+    }
+    out
+}
+
+fn pack_lines_with_budget(lines: Vec<String>, max_lines: usize, max_chars: usize) -> Vec<String> {
+    let total_lines = lines.len();
+    let mut out = Vec::new();
+    let mut used = 0usize;
+    for line in lines {
+        if out.len() >= max_lines {
+            break;
+        }
+        let line_chars = line.chars().count();
+        let extra = if out.is_empty() {
+            line_chars
+        } else {
+            line_chars + 1
+        };
+        if used + extra > max_chars {
+            break;
+        }
+        used += extra;
+        out.push(line);
+    }
+    if out.is_empty() {
+        return vec!["No relevant indexed shell context was found.".to_string()];
+    }
+    let trunc = "... context truncated for budget ...";
+    let trunc_extra = trunc.chars().count() + 1;
+    if out.len() < total_lines && out.len() < max_lines && used + trunc_extra <= max_chars {
+        out.push(trunc.to_string());
+    }
+    out
+}
+
+fn recency_boost(idx: usize, total: f32) -> f32 {
+    if total <= 1.0 {
+        return 1.0;
+    }
+    let idx = idx as f32;
+    ((total - idx) / total).max(0.0)
+}
+
+fn token_overlap_count(text: &str, tokens: &[String]) -> usize {
+    if tokens.is_empty() {
+        return 0;
+    }
+    let lowered = text.to_lowercase();
+    tokens
+        .iter()
+        .filter(|token| lowered.contains(token.as_str()))
+        .count()
+}
+
+fn ts_reason(ts_ms: Option<i64>) -> String {
+    match ts_ms {
+        Some(ts) => format!("ts={ts}"),
+        None => "ts=unknown".to_string(),
+    }
 }
 
 fn ingest_session_from_dir(
@@ -444,12 +974,14 @@ fn ingest_session_from_dir(
 
 #[derive(Debug)]
 struct EventRecord {
+    ts_ms: Option<i64>,
     kind: String,
     data: Value,
 }
 
 #[derive(Debug)]
 struct OutputRecord {
+    id: i64,
     stream: String,
     line_text: String,
 }
@@ -496,7 +1028,7 @@ fn load_output_lines(
     let mut stmt = conn
         .prepare(
             "
-            SELECT stream, line_text
+            SELECT id, stream, line_text
             FROM pane_output
             WHERE session_id = ?1
             ORDER BY id DESC
@@ -507,8 +1039,9 @@ fn load_output_lines(
     let rows = stmt
         .query_map(params![session_id, limit], |row| {
             Ok(OutputRecord {
-                stream: row.get::<_, String>(0)?,
-                line_text: row.get::<_, String>(1)?,
+                id: row.get::<_, i64>(0)?,
+                stream: row.get::<_, String>(1)?,
+                line_text: row.get::<_, String>(2)?,
             })
         })
         .map_err(|err| err.to_string())?;
@@ -529,7 +1062,7 @@ fn load_events(
     let mut stmt = conn
         .prepare(
             "
-            SELECT kind, data_json
+            SELECT ts_ms, kind, data_json
             FROM events
             WHERE session_id = ?1
             ORDER BY id DESC
@@ -539,10 +1072,11 @@ fn load_events(
         .map_err(|err| err.to_string())?;
     let rows = stmt
         .query_map(params![session_id, limit], |row| {
-            let kind: String = row.get(0)?;
-            let data_json: String = row.get(1)?;
+            let ts_ms: Option<i64> = row.get(0)?;
+            let kind: String = row.get(1)?;
+            let data_json: String = row.get(2)?;
             let data = serde_json::from_str::<Value>(&data_json).unwrap_or(Value::Null);
-            Ok(EventRecord { kind, data })
+            Ok(EventRecord { ts_ms, kind, data })
         })
         .map_err(|err| err.to_string())?;
     let mut out = Vec::new();
@@ -587,134 +1121,6 @@ fn load_file_edits(
     Ok(out)
 }
 
-fn collect_failing_commands(events: &[EventRecord], max: usize) -> Vec<String> {
-    let mut out = Vec::new();
-    for event in events {
-        if event.kind != "command.end" {
-            continue;
-        }
-        let exit = event.data.get("exit").and_then(value_to_i64).unwrap_or(0);
-        if exit == 0 {
-            continue;
-        }
-        out.push(format!("command ended with exit {exit}"));
-        if out.len() >= max {
-            break;
-        }
-    }
-    out
-}
-
-fn collect_failing_tools(events: &[EventRecord], max: usize) -> Vec<String> {
-    let mut out = Vec::new();
-    for event in events {
-        if event.kind != "tool.end" {
-            continue;
-        }
-        let ok = event
-            .data
-            .get("ok")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(true);
-        if ok {
-            continue;
-        }
-        let tool = event
-            .data
-            .get("tool")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown");
-        let error = event
-            .data
-            .get("error")
-            .map(|v| truncate_line(&v.to_string(), 120))
-            .unwrap_or_else(|| "unknown error".to_string());
-        out.push(format!("{tool} failed: {error}"));
-        if out.len() >= max {
-            break;
-        }
-    }
-    out
-}
-
-fn collect_related_lines(lines: &[String], tokens: &[String], max: usize) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut seen = HashSet::new();
-
-    for line in lines {
-        let normalized = line.trim();
-        if normalized.is_empty() {
-            continue;
-        }
-        if !tokens.is_empty() && !contains_any_token(normalized, tokens) {
-            continue;
-        }
-        if seen.insert(normalized.to_string()) {
-            out.push(normalized.to_string());
-        }
-        if out.len() >= max {
-            return out;
-        }
-    }
-
-    if out.is_empty() {
-        for line in lines.iter().take(max) {
-            let normalized = line.trim();
-            if normalized.is_empty() {
-                continue;
-            }
-            if seen.insert(normalized.to_string()) {
-                out.push(normalized.to_string());
-            }
-        }
-    }
-    out
-}
-
-fn collect_related_output(lines: &[OutputRecord], tokens: &[String], max: usize) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut seen = HashSet::new();
-    for rec in lines {
-        let line = rec.line_text.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let lowered = line.to_lowercase();
-        let has_error_signal = contains_error_signal(&lowered) || rec.stream == "stderr";
-        let token_match = !tokens.is_empty() && contains_any_token(&lowered, tokens);
-        if !(has_error_signal || token_match) {
-            continue;
-        }
-        let decorated = format!("[{}] {}", rec.stream, line);
-        if seen.insert(decorated.clone()) {
-            out.push(decorated);
-        }
-        if out.len() >= max {
-            break;
-        }
-    }
-    out
-}
-
-fn collect_recent_edits(edits: &[FileEditRecord], max: usize) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut seen = HashSet::new();
-    for rec in edits {
-        let Some(path) = rec.path.as_deref() else {
-            continue;
-        };
-        let mode = rec.write_mode.as_deref().unwrap_or("unknown");
-        let line = format!("{path} ({mode})");
-        if seen.insert(line.clone()) {
-            out.push(line);
-        }
-        if out.len() >= max {
-            break;
-        }
-    }
-    out
-}
-
 fn query_tokens(query: &str) -> Vec<String> {
     let stopwords = [
         "what", "did", "i", "me", "my", "the", "a", "an", "to", "of", "in", "on", "for", "with",
@@ -734,11 +1140,6 @@ fn query_tokens(query: &str) -> Vec<String> {
         .collect()
 }
 
-fn contains_any_token(text: &str, tokens: &[String]) -> bool {
-    let lowered = text.to_lowercase();
-    tokens.iter().any(|token| lowered.contains(token))
-}
-
 fn contains_error_signal(text: &str) -> bool {
     [
         "error",
@@ -753,6 +1154,16 @@ fn contains_error_signal(text: &str) -> bool {
     ]
     .iter()
     .any(|needle| text.contains(needle))
+}
+
+fn value_to_searchable_text(value: &Value) -> String {
+    if let Some(s) = value.as_str() {
+        return s.to_string();
+    }
+    if value.is_null() {
+        return "null".to_string();
+    }
+    value.to_string()
 }
 
 fn truncate_line(text: &str, max_chars: usize) -> String {
@@ -1157,7 +1568,8 @@ mod tests {
 
         write_file(
             &session_dir.join("events.jsonl"),
-            "{\"ts_ms\":10,\"session_id\":\"sess_test_context\",\"kind\":\"command.end\",\"data\":{\"exit\":101}}\n\
+            "{\"ts_ms\":9,\"session_id\":\"sess_test_context\",\"kind\":\"command.start\",\"data\":{\"cmd\":\"cargo build\"}}\n\
+             {\"ts_ms\":10,\"session_id\":\"sess_test_context\",\"kind\":\"command.end\",\"data\":{\"exit\":101}}\n\
              {\"ts_ms\":11,\"session_id\":\"sess_test_context\",\"kind\":\"tool.end\",\"data\":{\"tool\":\"shell\",\"ok\":false,\"error\":\"build failed\"}}\n\
              {\"ts_ms\":12,\"session_id\":\"sess_test_context\",\"kind\":\"tool.start\",\"data\":{\"tool\":\"fs.write\",\"args\":{\"path\":\"src/main.rs\",\"content\":\"fn main(){}\"}}}\n",
         );
@@ -1171,15 +1583,20 @@ mod tests {
         init(&db_path).unwrap();
         ingest_session(&root, &db_path, session_id).unwrap();
 
-        let context = build_relevant_context(
+        let context = build_relevant_context_bundle_with_options(
             &db_path,
             session_id,
             "what did i do wrong with cargo build?",
-            120,
+            BuildContextOptions {
+                max_lines: 120,
+                ..BuildContextOptions::default()
+            },
         )
-        .unwrap();
+        .unwrap()
+        .context_text;
 
         assert!(context.contains("Recent command failures"));
+        assert!(context.contains("cargo build -> exit 101"));
         assert!(context.contains("exit 101"));
         assert!(context.contains("Related commands"));
         assert!(context.contains("cargo build"));
@@ -1200,7 +1617,8 @@ mod tests {
 
         write_file(
             &session_dir.join("events.jsonl"),
-            "{\"ts_ms\":5,\"session_id\":\"sess_test_bundle\",\"kind\":\"command.end\",\"data\":{\"exit\":2}}\n\
+            "{\"ts_ms\":4,\"session_id\":\"sess_test_bundle\",\"kind\":\"command.start\",\"data\":{\"cmd\":\"git status\"}}\n\
+             {\"ts_ms\":5,\"session_id\":\"sess_test_bundle\",\"kind\":\"command.end\",\"data\":{\"exit\":2}}\n\
              {\"ts_ms\":6,\"session_id\":\"sess_test_bundle\",\"kind\":\"tool.start\",\"data\":{\"tool\":\"fs.write\",\"args\":{\"path\":\"README.md\",\"content\":\"x\"}}}\n",
         );
         write_file(&session_dir.join("stdin.log"), "git status\n");
@@ -1213,14 +1631,101 @@ mod tests {
         init(&db_path).unwrap();
         ingest_session(&root, &db_path, session_id).unwrap();
 
-        let bundle =
-            build_relevant_context_bundle(&db_path, session_id, "git failed", 120).unwrap();
+        let bundle = build_relevant_context_bundle_with_options(
+            &db_path,
+            session_id,
+            "git failed",
+            BuildContextOptions {
+                max_lines: 120,
+                ..BuildContextOptions::default()
+            },
+        )
+        .unwrap();
         assert_eq!(bundle.session_id, session_id);
         assert!(!bundle.query_tokens.is_empty());
         assert!(!bundle.failing_commands.is_empty());
         assert!(!bundle.recent_edits.is_empty());
         assert!(!bundle.related_output.is_empty());
+        assert!(!bundle.selected_evidence.is_empty());
+        assert!(bundle.failing_commands[0].contains("git status"));
         assert!(bundle.context_text.contains("Recent command failures"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn context_bundle_respects_max_chars_budget() {
+        let root = test_root("budget");
+        let session_id = "sess_test_budget";
+        let session_dir = root.join(session_id);
+        fs::create_dir_all(&session_dir).unwrap();
+
+        write_file(
+            &session_dir.join("events.jsonl"),
+            "{\"ts_ms\":4,\"session_id\":\"sess_test_budget\",\"kind\":\"command.start\",\"data\":{\"cmd\":\"cargo test --workspace --all-features\"}}\n\
+             {\"ts_ms\":5,\"session_id\":\"sess_test_budget\",\"kind\":\"command.end\",\"data\":{\"exit\":101}}\n",
+        );
+        write_file(
+            &session_dir.join("stderr.log"),
+            "error: this is a long synthetic error line for budget testing\n",
+        );
+
+        let db_path = root.join("logs.sqlite");
+        init(&db_path).unwrap();
+        ingest_session(&root, &db_path, session_id).unwrap();
+
+        let options = BuildContextOptions {
+            max_lines: 120,
+            max_chars: 180,
+            output_window: 1,
+            max_evidence: 36,
+        };
+        let bundle = build_relevant_context_bundle_with_options(
+            &db_path,
+            session_id,
+            "what failed?",
+            options,
+        )
+        .unwrap();
+        assert!(bundle.context_text.chars().count() <= 180);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn output_window_adds_neighbor_lines() {
+        let root = test_root("window");
+        let session_id = "sess_test_window";
+        let session_dir = root.join(session_id);
+        fs::create_dir_all(&session_dir).unwrap();
+
+        write_file(
+            &session_dir.join("output.log"),
+            "build started\nTOKEN_MATCH_FAILURE\nhint: check imports\n",
+        );
+
+        let db_path = root.join("logs.sqlite");
+        init(&db_path).unwrap();
+        ingest_session(&root, &db_path, session_id).unwrap();
+
+        let options = BuildContextOptions {
+            max_lines: 120,
+            max_chars: 4500,
+            output_window: 1,
+            max_evidence: 36,
+        };
+        let bundle = build_relevant_context_bundle_with_options(
+            &db_path,
+            session_id,
+            "token_match_failure",
+            options,
+        )
+        .unwrap();
+
+        let output = bundle.related_output.join("\n");
+        assert!(output.contains("[merged] TOKEN_MATCH_FAILURE"));
+        assert!(output.contains("[merged] build started"));
+        assert!(output.contains("[merged] hint: check imports"));
 
         let _ = fs::remove_dir_all(root);
     }
