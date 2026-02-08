@@ -194,8 +194,8 @@ fn resolve_path(path: &Path) -> PathBuf {
 
 fn apply_env_overrides(cfg: &mut Config) {
     let base_url = env_nonempty("AISH_OPENAI_COMPAT_BASE_URL");
-    let api_key = env_nonempty("AISH_OPENAI_COMPAT_API_KEY")
-        .or_else(|| env_nonempty("ZAI_API_KEY"));
+    let api_key =
+        env_nonempty("AISH_OPENAI_COMPAT_API_KEY").or_else(|| env_nonempty("ZAI_API_KEY"));
     let model = env_nonempty("AISH_OPENAI_COMPAT_MODEL");
     let completions_path = env_nonempty("AISH_OPENAI_COMPAT_COMPLETIONS_PATH");
 

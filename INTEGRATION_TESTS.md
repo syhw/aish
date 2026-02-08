@@ -22,6 +22,11 @@ Relevance eval harness:
 AISHD_URL=http://127.0.0.1:5033 python3 scripts/relevance_eval.py
 ```
 
+Restart/resume workflow test (isolated daemon/config):
+```
+scripts/test_resume_workflow.sh
+```
+
 ## Tests (manual description)
 
 ### 1) Health + Version
@@ -84,3 +89,20 @@ Optional (LLM):
 
 ### 12) tmux diagnostics
 - `GET /v1/diagnostics/tmux` returns `ok: true` and shows create/list/cleanup steps.
+
+### 13) Restart + Resume Workflow (reboot simulation)
+- Starts isolated `aishd` with temporary config/log dir and unique tmux prefix.
+- Creates multiple sessions (simulating multiple terminals), each with:
+  - one main agent
+  - one subagent
+- Verifies tmux layout:
+  - per-session human tmux shows only main agent window(s)
+  - subagents are not shown in human tmux window list
+- Simulates reboot:
+  - force-kills `aishd`
+  - removes all test tmux sessions
+- Restarts `aishd` with same config and verifies:
+  - sessions are restored from persisted store
+  - agent/subagent tmux sessions are recreated
+  - per-session human tmux view is restored (main only)
+  - resumed agents can execute new flow tasks successfully

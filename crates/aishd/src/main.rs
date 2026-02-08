@@ -14,7 +14,7 @@ use chrono::Utc;
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -74,6 +74,7 @@ async fn main() -> Result<()> {
         log_index_path,
         run_cancels: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
     };
+    reconcile_tmux_state(&state);
 
     let app = Router::new()
         .route("/health", get(health))
@@ -98,10 +99,34 @@ async fn main() -> Result<()> {
         .route("/v1/tools/:name/call", post(call_tool))
         .route("/v1/logs/ingest/:session_id", post(ingest_logs_session))
         .route("/v1/logs/context/:session_id", get(get_logs_context))
-        .with_state(state);
+        .with_state(state.clone());
 
-    axum::serve(listener, app).await?;
+    let shutdown_state = state.clone();
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            shutdown_signal().await;
+            shutdown_tmux_sessions(&shutdown_state);
+        })
+        .await?;
     Ok(())
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("failed to install SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {},
+            _ = terminate.recv() => {},
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 fn apply_bind_override(cfg: &mut Config, bind: &str) -> Result<()> {
@@ -568,6 +593,20 @@ async fn create_session(
 ) -> Response {
     let mut store = state.store.lock().unwrap();
     let id = store.next_id("sess");
+    let tmux_name = default_session_tmux_name(&state.cfg, &id);
+    let created = match ensure_tmux_session(&tmux_name, None) {
+        Ok(created) => created,
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": err})),
+            )
+                .into_response();
+        }
+    };
+    if created {
+        let _ = ensure_session_placeholder_window(&tmux_name);
+    }
     let now = now_ms();
     let session = Session {
         id: id.clone(),
@@ -576,7 +615,7 @@ async fn create_session(
         updated_at: now,
         status: "idle".to_string(),
         share_state: req.share_state.unwrap_or_else(|| "manual".to_string()),
-        tmux_session_name: None,
+        tmux_session_name: Some(tmux_name),
     };
     store.sessions.insert(id.clone(), session.clone());
     if let Err(err) = append_store_event(
@@ -837,6 +876,11 @@ fn create_agent_internal(
         )
             .into_response());
     }
+    let is_main_agent = req.parent_agent_id.is_none();
+    let session_tmux_name = store
+        .sessions
+        .get(session_id)
+        .and_then(|session| session.tmux_session_name.clone());
     let id = store.next_id("agent");
 
     let parent_worktree = req
@@ -869,12 +913,12 @@ fn create_agent_internal(
         }
     };
 
-    let tmux_name = format!("{}-{}-{}", state.cfg.tmux.session_prefix, session_id, id);
+    let tmux_name = default_agent_tmux_name(&state.cfg, session_id, &id);
     let tmux_cwd = worktree.as_deref();
-    if let Err(err) = spawn_tmux_session(&tmux_name, tmux_cwd) {
+    if let Err(err) = ensure_tmux_session(&tmux_name, tmux_cwd) {
         return Err((
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": err.to_string()})),
+            Json(json!({"error": err})),
         )
             .into_response());
     }
@@ -885,7 +929,7 @@ fn create_agent_internal(
         parent_agent_id: req.parent_agent_id,
         model: req.model,
         status: "idle".to_string(),
-        tmux_session_name: Some(tmux_name),
+        tmux_session_name: Some(tmux_name.clone()),
         worktree,
     };
     store.agents.insert(id.clone(), agent.clone());
@@ -909,6 +953,13 @@ fn create_agent_internal(
         now_ms(),
     ) {
         eprintln!("log index agent upsert failed: {err}");
+    }
+    if is_main_agent {
+        if let Some(session_tmux_name) = session_tmux_name.as_deref() {
+            if let Err(err) = link_main_agent_window(session_tmux_name, &tmux_name, &id) {
+                eprintln!("tmux main-agent link failed: {err}");
+            }
+        }
     }
     Ok(agent)
 }
@@ -3009,6 +3060,88 @@ mod tests {
         let rendered = render_template(value, &outputs);
         assert_eq!(rendered, Value::String("Value: hello".to_string()));
     }
+
+    #[test]
+    fn tmux_name_helpers_use_expected_prefixes() {
+        let mut cfg = Config::default();
+        cfg.tmux.session_prefix = "aish".to_string();
+        assert_eq!(
+            default_session_tmux_name(&cfg, "sess_123"),
+            "aish-sess-sess_123"
+        );
+        assert_eq!(
+            default_agent_tmux_name(&cfg, "sess_123", "agent_456"),
+            "aish-sess_123-agent_456"
+        );
+    }
+
+    #[test]
+    fn tmux_session_from_target_strips_window_suffix() {
+        assert_eq!(tmux_session_from_target("abc"), "abc");
+        assert_eq!(tmux_session_from_target("abc:1"), "abc");
+        assert_eq!(tmux_session_from_target("abc:main"), "abc");
+    }
+
+    #[test]
+    fn store_event_session_round_trip() {
+        let session = Session {
+            id: "sess_1".to_string(),
+            title: "t".to_string(),
+            created_at: 1_770_499_392_377,
+            updated_at: 1_770_499_392_377,
+            status: "idle".to_string(),
+            share_state: "manual".to_string(),
+            tmux_session_name: Some("aish-sess-sess_1".to_string()),
+        };
+        let line = serde_json::to_string(&StoreEvent::SessionUpsert(session.clone())).unwrap();
+        let parsed: StoreEvent = serde_json::from_str(&line).unwrap();
+        match parsed {
+            StoreEvent::SessionUpsert(got) => {
+                assert_eq!(got.id, session.id);
+                assert_eq!(got.created_at, session.created_at);
+                assert_eq!(got.updated_at, session.updated_at);
+            }
+            _ => panic!("expected session upsert"),
+        }
+    }
+
+    #[test]
+    fn load_store_recovers_session_and_agent() {
+        let path = std::env::temp_dir().join(format!("aish-load-store-{}.jsonl", now_ms()));
+        let session = Session {
+            id: "sess_1".to_string(),
+            title: "t".to_string(),
+            created_at: 1_770_499_392_377,
+            updated_at: 1_770_499_392_377,
+            status: "idle".to_string(),
+            share_state: "manual".to_string(),
+            tmux_session_name: Some("aish-sess-sess_1".to_string()),
+        };
+        let agent = Agent {
+            id: "agent_1".to_string(),
+            session_id: "sess_1".to_string(),
+            parent_agent_id: None,
+            model: None,
+            status: "idle".to_string(),
+            tmux_session_name: Some("aish-sess_1-agent_1".to_string()),
+            worktree: None,
+        };
+        append_jsonl(
+            &path,
+            &serde_json::to_value(StoreEvent::SessionUpsert(session)).unwrap(),
+        )
+        .unwrap();
+        append_jsonl(
+            &path,
+            &serde_json::to_value(StoreEvent::AgentUpsert(agent)).unwrap(),
+        )
+        .unwrap();
+
+        let store = load_store(&path).unwrap();
+        assert_eq!(store.sessions.len(), 1);
+        assert_eq!(store.agents.len(), 1);
+        let _ = fs::remove_file(path);
+    }
 }
 
 fn run_fs_read(args: Value) -> Result<Value, (StatusCode, Value)> {
@@ -3166,6 +3299,18 @@ fn append_jsonl(path: &Path, value: &Value) -> Result<(), std::io::Error> {
     Ok(())
 }
 
+fn append_jsonl_serializable<T: Serialize>(path: &Path, value: &T) -> Result<(), std::io::Error> {
+    use std::io::Write;
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    serde_json::to_writer(&mut file, value)
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err.to_string()))?;
+    writeln!(file)?;
+    Ok(())
+}
+
 fn now_ms() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -3254,11 +3399,33 @@ fn load_store(path: &Path) -> Result<Store, std::io::Error> {
         if line.is_empty() {
             continue;
         }
-        if let Ok(event) = serde_json::from_str::<StoreEvent>(line) {
+        if let Some(event) = parse_store_event_line(line) {
             apply_event(&mut store, event);
         }
     }
     Ok(store)
+}
+
+fn parse_store_event_line(line: &str) -> Option<StoreEvent> {
+    if let Ok(event) = serde_json::from_str::<StoreEvent>(line) {
+        return Some(event);
+    }
+    let value: Value = serde_json::from_str(line).ok()?;
+    let obj = value.as_object()?;
+    let event_type = obj.get("type")?.as_str()?;
+    let data = obj.get("data")?.clone();
+    match event_type {
+        "session.upsert" => serde_json::from_value::<Session>(data)
+            .ok()
+            .map(StoreEvent::SessionUpsert),
+        "agent.upsert" => serde_json::from_value::<Agent>(data)
+            .ok()
+            .map(StoreEvent::AgentUpsert),
+        "run.upsert" => serde_json::from_value::<Run>(data)
+            .ok()
+            .map(StoreEvent::RunUpsert),
+        _ => None,
+    }
 }
 
 fn apply_event(store: &mut Store, event: StoreEvent) {
@@ -3279,10 +3446,7 @@ fn apply_event(store: &mut Store, event: StoreEvent) {
 }
 
 fn append_store_event(path: &Path, event: StoreEvent) -> Result<(), std::io::Error> {
-    append_jsonl(
-        path,
-        &serde_json::to_value(event).unwrap_or_else(|_| json!({})),
-    )
+    append_jsonl_serializable(path, &event)
 }
 
 fn index_store_snapshot(db_path: &Path, store: &Store) {
@@ -3328,6 +3492,313 @@ fn index_store_snapshot(db_path: &Path, store: &Store) {
         ) {
             eprintln!("log index run upsert failed: {err}");
         }
+    }
+}
+
+const SESSION_PLACEHOLDER_WINDOW: &str = "__aish_placeholder__";
+
+fn default_session_tmux_name(cfg: &Config, session_id: &str) -> String {
+    format!("{}-sess-{}", cfg.tmux.session_prefix, session_id)
+}
+
+fn default_agent_tmux_name(cfg: &Config, session_id: &str, agent_id: &str) -> String {
+    format!("{}-{}-{}", cfg.tmux.session_prefix, session_id, agent_id)
+}
+
+fn reconcile_tmux_state(state: &AppState) {
+    let now = now_ms();
+    let mut session_updates = Vec::new();
+    let mut agent_updates = Vec::new();
+    let mut run_updates = Vec::new();
+    let mut session_targets = Vec::new();
+    let mut agent_targets = Vec::new();
+
+    {
+        let mut store = state.store.lock().unwrap();
+        for session in store.sessions.values_mut() {
+            let desired_tmux = session
+                .tmux_session_name
+                .clone()
+                .unwrap_or_else(|| default_session_tmux_name(&state.cfg, &session.id));
+            let mut changed = false;
+            if session.tmux_session_name.as_deref() != Some(desired_tmux.as_str()) {
+                session.tmux_session_name = Some(desired_tmux.clone());
+                session.updated_at = now;
+                changed = true;
+            }
+            if changed {
+                session_updates.push(session.clone());
+            }
+            session_targets.push((session.id.clone(), desired_tmux));
+        }
+
+        for agent in store.agents.values_mut() {
+            let desired_tmux = agent.tmux_session_name.clone().unwrap_or_else(|| {
+                default_agent_tmux_name(&state.cfg, &agent.session_id, &agent.id)
+            });
+            let mut changed = false;
+            if agent.tmux_session_name.as_deref() != Some(desired_tmux.as_str()) {
+                agent.tmux_session_name = Some(desired_tmux.clone());
+                changed = true;
+            }
+            if agent.status == "running" {
+                agent.status = "idle".to_string();
+                changed = true;
+            }
+            if changed {
+                agent_updates.push(agent.clone());
+            }
+            agent_targets.push((
+                agent.id.clone(),
+                agent.session_id.clone(),
+                agent.parent_agent_id.is_none(),
+                desired_tmux,
+                agent.worktree.clone(),
+            ));
+        }
+
+        for run in store.runs.values_mut() {
+            if run.status == "running" {
+                run.status = "interrupted".to_string();
+                run.ended_at = Some(now);
+                run_updates.push(run.clone());
+            }
+        }
+    }
+
+    for session in &session_updates {
+        let _ = append_store_event(
+            &state.store_path,
+            StoreEvent::SessionUpsert(session.clone()),
+        );
+        if let Err(err) = log_index::upsert_session(
+            &state.log_index_path,
+            &session.id,
+            &session.title,
+            &session.status,
+            &session.share_state,
+            session.tmux_session_name.as_deref(),
+            session.created_at,
+            session.updated_at,
+        ) {
+            eprintln!("log index session upsert failed: {err}");
+        }
+    }
+    for agent in &agent_updates {
+        let _ = append_store_event(&state.store_path, StoreEvent::AgentUpsert(agent.clone()));
+        if let Err(err) = log_index::upsert_agent(
+            &state.log_index_path,
+            &agent.id,
+            &agent.session_id,
+            agent.parent_agent_id.as_deref(),
+            agent.model.as_deref(),
+            &agent.status,
+            agent.tmux_session_name.as_deref(),
+            agent.worktree.as_deref(),
+            now,
+        ) {
+            eprintln!("log index agent upsert failed: {err}");
+        }
+    }
+    for run in &run_updates {
+        let _ = append_store_event(&state.store_path, StoreEvent::RunUpsert(run.clone()));
+        if let Err(err) = log_index::upsert_run(
+            &state.log_index_path,
+            &run.id,
+            &run.session_id,
+            &run.agent_id,
+            &run.mode,
+            &run.status,
+            run.started_at,
+            run.ended_at,
+        ) {
+            eprintln!("log index run upsert failed: {err}");
+        }
+    }
+
+    let mut session_tmux_names = BTreeMap::new();
+    for (session_id, session_tmux) in session_targets {
+        match ensure_tmux_session(&session_tmux, None) {
+            Ok(created) => {
+                if created {
+                    let _ = ensure_session_placeholder_window(&session_tmux);
+                }
+            }
+            Err(err) => eprintln!("tmux reconcile session failed ({session_id}): {err}"),
+        }
+        session_tmux_names.insert(session_id, session_tmux);
+    }
+
+    for (agent_id, session_id, is_main_agent, agent_tmux, worktree) in agent_targets {
+        if let Err(err) = ensure_tmux_session(&agent_tmux, worktree.as_deref()) {
+            eprintln!("tmux reconcile agent failed ({agent_id}): {err}");
+            continue;
+        }
+        if is_main_agent {
+            if let Some(session_tmux) = session_tmux_names.get(&session_id) {
+                if let Err(err) = link_main_agent_window(session_tmux, &agent_tmux, &agent_id) {
+                    eprintln!("tmux reconcile main-agent link failed ({agent_id}): {err}");
+                }
+            }
+        }
+    }
+}
+
+fn shutdown_tmux_sessions(state: &AppState) {
+    let (agent_sessions, session_sessions) = {
+        let store = state.store.lock().unwrap();
+        let mut agent_sessions = BTreeSet::new();
+        let mut session_sessions = BTreeSet::new();
+        for agent in store.agents.values() {
+            if let Some(target) = agent.tmux_session_name.as_deref() {
+                agent_sessions.insert(tmux_session_from_target(target));
+            }
+        }
+        for session in store.sessions.values() {
+            if let Some(target) = session.tmux_session_name.as_deref() {
+                session_sessions.insert(tmux_session_from_target(target));
+            }
+        }
+        (agent_sessions, session_sessions)
+    };
+
+    for session in agent_sessions {
+        kill_tmux_session_if_exists(&session);
+    }
+    for session in session_sessions {
+        kill_tmux_session_if_exists(&session);
+    }
+}
+
+fn tmux_session_from_target(target: &str) -> String {
+    target.split(':').next().unwrap_or(target).to_string()
+}
+
+fn ensure_tmux_session(name: &str, cwd: Option<&str>) -> Result<bool, String> {
+    if tmux_has_session(name) {
+        return Ok(false);
+    }
+    spawn_tmux_session(name, cwd).map_err(|err| err.to_string())?;
+    Ok(true)
+}
+
+fn ensure_session_placeholder_window(session_tmux: &str) -> Result<(), String> {
+    run_command_status(
+        "tmux",
+        &[
+            "rename-window",
+            "-t",
+            &format!("{session_tmux}:0"),
+            SESSION_PLACEHOLDER_WINDOW,
+        ],
+    )
+}
+
+fn link_main_agent_window(
+    session_tmux: &str,
+    agent_tmux: &str,
+    agent_id: &str,
+) -> Result<(), String> {
+    if !tmux_has_session(session_tmux) {
+        return Err(format!("session tmux not found: {session_tmux}"));
+    }
+    if !tmux_has_session(agent_tmux) {
+        return Err(format!("agent tmux not found: {agent_tmux}"));
+    }
+
+    let window_names = list_tmux_window_names(session_tmux)?;
+    if window_names.iter().any(|name| name == agent_id) {
+        return Ok(());
+    }
+
+    let next_index = next_tmux_window_index(session_tmux)?;
+    run_command_status(
+        "tmux",
+        &[
+            "link-window",
+            "-s",
+            &format!("{agent_tmux}:0"),
+            "-t",
+            &format!("{session_tmux}:{next_index}"),
+        ],
+    )?;
+    run_command_status(
+        "tmux",
+        &[
+            "rename-window",
+            "-t",
+            &format!("{session_tmux}:{next_index}"),
+            agent_id,
+        ],
+    )?;
+    drop_session_placeholder_window(session_tmux)?;
+    Ok(())
+}
+
+fn drop_session_placeholder_window(session_tmux: &str) -> Result<(), String> {
+    let window_names = list_tmux_window_names(session_tmux)?;
+    if window_names.len() <= 1
+        || !window_names
+            .iter()
+            .any(|name| name == SESSION_PLACEHOLDER_WINDOW)
+    {
+        return Ok(());
+    }
+    run_command_status(
+        "tmux",
+        &[
+            "kill-window",
+            "-t",
+            &format!("{session_tmux}:{SESSION_PLACEHOLDER_WINDOW}"),
+        ],
+    )?;
+    Ok(())
+}
+
+fn list_tmux_window_names(session_tmux: &str) -> Result<Vec<String>, String> {
+    let output = run_command_output(
+        "tmux",
+        &["list-windows", "-t", session_tmux, "-F", "#{window_name}"],
+    )?;
+    Ok(output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToString::to_string)
+        .collect())
+}
+
+fn next_tmux_window_index(session_tmux: &str) -> Result<u32, String> {
+    let output = run_command_output(
+        "tmux",
+        &["list-windows", "-t", session_tmux, "-F", "#{window_index}"],
+    )?;
+    let max_idx = output
+        .lines()
+        .filter_map(|line| line.trim().parse::<u32>().ok())
+        .max()
+        .unwrap_or(0);
+    Ok(max_idx.saturating_add(1))
+}
+
+fn tmux_has_session(name: &str) -> bool {
+    std::process::Command::new("tmux")
+        .arg("has-session")
+        .arg("-t")
+        .arg(name)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn kill_tmux_session_if_exists(name: &str) {
+    if !tmux_has_session(name) {
+        return;
+    }
+    if let Err(err) = run_command_status("tmux", &["kill-session", "-t", name]) {
+        eprintln!("tmux cleanup failed for {name}: {err}");
     }
 }
 

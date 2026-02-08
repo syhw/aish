@@ -9,7 +9,7 @@ aish is a zsh-compatible shell + daemon that runs inside tmux, logs activity, an
 - **Logging**: JSONL event logs, stdin command capture, PTY output capture.
 - **Log index**: SQLite index (`logs.sqlite`) for queryable context across events/input/output/file edits.
 - **Sessions + agents**: in-memory registry with JSONL persistence.
-- **tmux**: per-agent tmux sessions, diagnostics endpoint.
+- **tmux**: per-agent tmux sessions, per-session main-agent view, startup reconcile, graceful cleanup on daemon shutdown, diagnostics endpoint.
 - **Worktrees**: optional git worktrees per agent (inherit/new/none).
 - **Subagents / swarms**: parallel or sequential subagents with aggregation.
 - **Flows**: simple DAG execution with LLM/tool/aggregate nodes.
@@ -181,6 +181,16 @@ Run:
 ```bash
 AISHD_URL=http://127.0.0.1:5033 scripts/run_integration_tests.sh
 ```
+Reboot/restart resume workflow test:
+```bash
+scripts/test_resume_workflow.sh
+```
+
+## Usage Examples
+See `EXAMPLES.md` for copy-paste workflows covering:
+- `aish launch` / `aish serve` / `aish llm`
+- session/agent/subagent/flow API usage
+- restart/resume and troubleshooting patterns
 
 ## Relevance Eval Harness
 Evaluate retrieval relevance for `/v1/logs/context` against predefined cases:
