@@ -159,7 +159,45 @@ curl -fsS "$AISHD_URL/v1/logs/context/$SID?q=what%20did%20i%20do%20wrong&max_lin
   | python3 -m json.tool
 ```
 
-## 10) Useful diagnostics
+## 10) Relevant context retrieval (end-to-end)
+
+This example intentionally creates failures, then retrieves relevant context and
+uses it in an LLM call.
+
+```bash
+export AISHD_URL="http://127.0.0.1:5033"
+
+# Create isolated session + agent
+SESSION_JSON=$(curl -fsS "$AISHD_URL/v1/sessions" \
+  -H 'content-type: application/json' \
+  -d '{"title":"context-debug-demo"}')
+SID=$(python3 -c 'import sys,json; print(json.load(sys.stdin)["id"])' <<<"$SESSION_JSON")
+AGENT_JSON=$(curl -fsS "$AISHD_URL/v1/sessions/$SID/agents" \
+  -H 'content-type: application/json' \
+  -d '{}')
+AID=$(python3 -c 'import sys,json; print(json.load(sys.stdin)["id"])' <<<"$AGENT_JSON")
+
+# Produce a failing run (shell command exits non-zero)
+curl -fsS "$AISHD_URL/v1/agents/$AID/run" \
+  -H 'content-type: application/json' \
+  -d '{"prompt":"Run tool shell with cmd `ls /definitely-not-real` and report the result.","tools":["shell"],"approved_tools":["shell"],"approved":true}' \
+  | python3 -m json.tool
+
+# Ensure log index is updated for this session
+curl -fsS -X POST "$AISHD_URL/v1/logs/ingest/$SID" | python3 -m json.tool
+
+# Inspect selected evidence/context bundle directly
+curl -fsS "$AISHD_URL/v1/logs/context/$SID?q=why%20did%20my%20command%20fail&max_lines=120&max_chars=4500&output_window=1" \
+  | python3 -m json.tool
+
+# Ask for analysis with diagnostic context mode
+curl -fsS "$AISHD_URL/v1/completions" \
+  -H 'content-type: application/json' \
+  -d "{\"prompt\":\"What did I do wrong in this session?\",\"session_id\":\"$SID\",\"context_mode\":\"diagnostic\"}" \
+  | python3 -m json.tool
+```
+
+## 11) Useful diagnostics
 
 tmux diagnostics:
 
