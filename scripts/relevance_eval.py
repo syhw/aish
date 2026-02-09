@@ -105,7 +105,12 @@ def get_context_bundle(base_url: str, session_id: str, case: dict[str, Any]) -> 
         "max_lines": str(options.get("max_lines", 120)),
         "max_chars": str(options.get("max_chars", 4500)),
         "output_window": str(options.get("output_window", 1)),
+        "max_incidents": str(options.get("max_incidents", 6)),
+        "include_artifacts": str(bool(options.get("include_artifacts", True))).lower(),
+        "explain": str(bool(options.get("explain", False))).lower(),
     }
+    if options.get("intent"):
+        params["intent"] = str(options["intent"])
     url = (
         f"{base_url}/v1/logs/context/{session_id}?"
         + urllib.parse.urlencode(params, safe="")
@@ -137,20 +142,31 @@ def evaluate_bundle(case: dict[str, Any], bundle: dict[str, Any]) -> CaseResult:
     name = case.get("name", "unnamed")
 
     context_text = str(bundle.get("context_text", ""))
-    context_lc = normalize(context_text)
     evidence = bundle.get("selected_evidence", [])
+    incidents = bundle.get("incidents", [])
+    artifacts = bundle.get("artifacts", [])
     evidence_categories = {
         str(item.get("category")) for item in evidence if isinstance(item, dict)
     }
     evidence_blob = "\n".join(
         str(item.get("text", "")) for item in evidence if isinstance(item, dict)
     )
-    evidence_blob_lc = normalize(evidence_blob)
+    incident_blob = "\n".join(
+        f"{item.get('title', '')}\n" + "\n".join(item.get("summary", []))
+        for item in incidents
+        if isinstance(item, dict)
+    )
+    artifact_blob = "\n".join(
+        str(item.get("text", "")) for item in artifacts if isinstance(item, dict)
+    )
+    combined_lc = normalize(
+        "\n".join([context_text, evidence_blob, incident_blob, artifact_blob])
+    )
 
     for needle in expect.get("must_contain", []):
         checks_total += 1
         n = normalize(str(needle))
-        if n in context_lc or n in evidence_blob_lc:
+        if n in combined_lc:
             checks_passed += 1
         else:
             failures.append(f"missing text: {needle}")
@@ -172,6 +188,41 @@ def evaluate_bundle(case: dict[str, Any], bundle: dict[str, Any]) -> CaseResult:
             failures.append(
                 f"selected_evidence too small: {len(evidence)} < {minimum}"
             )
+
+    if "intent" in expect:
+        checks_total += 1
+        expected_intent = str(expect["intent"])
+        if str(bundle.get("intent", "")) == expected_intent:
+            checks_passed += 1
+        else:
+            failures.append(
+                f"intent mismatch: got {bundle.get('intent')} expected {expected_intent}"
+            )
+
+    if "min_incidents" in expect:
+        checks_total += 1
+        minimum = int(expect["min_incidents"])
+        if len(incidents) >= minimum:
+            checks_passed += 1
+        else:
+            failures.append(f"incidents too small: {len(incidents)} < {minimum}")
+
+    if "min_artifacts" in expect:
+        checks_total += 1
+        minimum = int(expect["min_artifacts"])
+        if len(artifacts) >= minimum:
+            checks_passed += 1
+        else:
+            failures.append(f"artifacts too small: {len(artifacts)} < {minimum}")
+
+    if "explain" in expect:
+        checks_total += 1
+        should_have = bool(expect["explain"])
+        has_explain = isinstance(bundle.get("explain"), dict)
+        if has_explain == should_have:
+            checks_passed += 1
+        else:
+            failures.append(f"explain mismatch: got {has_explain} expected {should_have}")
 
     if "max_context_chars" in expect:
         checks_total += 1

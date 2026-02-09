@@ -171,9 +171,17 @@ struct CompletionRequest {
     messages: Option<Vec<ChatMessage>>,
     session_id: Option<String>,
     context_mode: Option<String>,
+    context_intent: Option<String>,
     context_max_lines: Option<usize>,
     context_max_chars: Option<usize>,
     context_output_window: Option<usize>,
+    context_max_incidents: Option<usize>,
+    context_include_artifacts: Option<bool>,
+    context_explain: Option<bool>,
+    context_selector_chunk_tokens: Option<usize>,
+    context_selector_max_chunks: Option<usize>,
+    context_selector_include_events: Option<bool>,
+    context_selector_model: Option<String>,
     model: Option<String>,
     provider: Option<String>,
     max_tokens: Option<u32>,
@@ -351,12 +359,14 @@ enum ContextMode {
     Off,
     Diagnostic,
     Always,
+    LlmSelect,
 }
 
 fn parse_context_mode(value: Option<&str>) -> ContextMode {
     match value.unwrap_or("off").trim().to_lowercase().as_str() {
         "always" => ContextMode::Always,
         "diagnostic" => ContextMode::Diagnostic,
+        "llm-select" | "llm_select" | "selector" => ContextMode::LlmSelect,
         _ => ContextMode::Off,
     }
 }
@@ -378,20 +388,14 @@ fn maybe_inject_completion_context(state: &AppState, req: &mut CompletionRequest
         return;
     }
 
-    let options = log_index::BuildContextOptions {
-        max_lines: req.context_max_lines.unwrap_or(120).clamp(40, 300),
-        max_chars: req.context_max_chars.unwrap_or(4500).clamp(120, 12000),
-        output_window: req.context_output_window.unwrap_or(1).clamp(0, 5),
-        ..log_index::BuildContextOptions::default()
+    let context = if mode == ContextMode::LlmSelect {
+        build_llm_selected_context(state, req, session_id, &query)
+            .or_else(|| deterministic_context_for_query(state, req, session_id, &query))
+    } else {
+        deterministic_context_for_query(state, req, session_id, &query)
     };
-    let context = match log_index::build_relevant_context_bundle_with_options(
-        &state.log_index_path,
-        session_id,
-        &query,
-        options,
-    ) {
-        Ok(bundle) if !bundle.context_text.trim().is_empty() => bundle.context_text,
-        _ => return,
+    let Some(context) = context else {
+        return;
     };
 
     let system_msg = ChatMessage {
@@ -414,6 +418,180 @@ fn maybe_inject_completion_context(state: &AppState, req: &mut CompletionRequest
             context, prompt
         );
     }
+}
+
+fn deterministic_context_for_query(
+    state: &AppState,
+    req: &CompletionRequest,
+    session_id: &str,
+    query: &str,
+) -> Option<String> {
+    let options = log_index::BuildContextOptions {
+        max_lines: req.context_max_lines.unwrap_or(120).clamp(40, 300),
+        max_chars: req.context_max_chars.unwrap_or(4500).clamp(120, 12000),
+        output_window: req.context_output_window.unwrap_or(1).clamp(0, 5),
+        max_incidents: req.context_max_incidents.unwrap_or(6).clamp(1, 16),
+        intent_override: req
+            .context_intent
+            .as_deref()
+            .and_then(log_index::QueryIntent::from_str),
+        include_artifacts: req.context_include_artifacts.unwrap_or(true),
+        explain: req.context_explain.unwrap_or(false),
+        ..log_index::BuildContextOptions::default()
+    };
+    match log_index::build_relevant_context_bundle_with_options(
+        &state.log_index_path,
+        session_id,
+        query,
+        options,
+    ) {
+        Ok(bundle) if !bundle.context_text.trim().is_empty() => Some(bundle.context_text),
+        _ => None,
+    }
+}
+
+fn build_llm_selected_context(
+    state: &AppState,
+    req: &CompletionRequest,
+    session_id: &str,
+    query: &str,
+) -> Option<String> {
+    let chunk_tokens = req
+        .context_selector_chunk_tokens
+        .unwrap_or(128_000)
+        .clamp(4_000, 128_000);
+    let max_chunks = req.context_selector_max_chunks.unwrap_or(16).clamp(1, 64);
+    let corpus = match log_index::build_llm_selection_corpus(
+        &state.log_index_path,
+        session_id,
+        log_index::BuildLlmSelectionCorpusOptions {
+            chunk_chars: chunk_tokens.saturating_mul(4),
+            max_chunks,
+            include_events: req.context_selector_include_events.unwrap_or(true),
+        },
+    ) {
+        Ok(value) => value,
+        Err(err) => {
+            eprintln!("llm-select corpus build failed: {err}");
+            return None;
+        }
+    };
+
+    if corpus.old_context_chunks.is_empty()
+        && corpus.last_stdin.is_empty()
+        && corpus.last_stdout.is_empty()
+        && corpus.last_stderr.is_empty()
+    {
+        return None;
+    }
+
+    let recent = render_recent_context_block(&corpus);
+    let provider = req.provider.clone();
+    let selector_model = req.context_selector_model.clone().or(req.model.clone());
+    let mut chunk_notes = Vec::new();
+
+    for (idx, chunk) in corpus.old_context_chunks.iter().enumerate() {
+        let selector_messages = vec![
+            ChatMessage {
+                role: "system".to_string(),
+                content: "You are a context selector for debugging and incident analysis. Select only evidence from the chunk that can help answer the query. Prefer concrete failures, commands, stderr, edits, and decisions. Keep output concise.".to_string(),
+            },
+            ChatMessage {
+                role: "user".to_string(),
+                content: format!(
+                    "Query:\n{query}\n\nRecent context (always include mentally):\n{recent}\n\nChunk {}/{}:\n{}\n\nReturn:\n- Most relevant evidence from this chunk (bullets)\n- Why each item matters for the query\n- Ignore irrelevant details",
+                    idx + 1,
+                    corpus.old_context_chunks.len(),
+                    chunk
+                ),
+            },
+        ];
+        match call_llm_with_messages(
+            &state.cfg,
+            provider.clone(),
+            selector_model.clone(),
+            &selector_messages,
+        ) {
+            Ok(text) => chunk_notes.push(format!(
+                "Chunk {}/{}:\n{}",
+                idx + 1,
+                corpus.old_context_chunks.len(),
+                truncate_text_chars(&text, 6000)
+            )),
+            Err(err) => {
+                eprintln!("llm-select chunk pass failed: {err}");
+            }
+        }
+    }
+
+    if chunk_notes.is_empty() {
+        return None;
+    }
+
+    let synthesis_messages = vec![
+        ChatMessage {
+            role: "system".to_string(),
+            content: "You are building final context for another LLM call. Produce a concise, debugging-focused relevant context pack with concrete evidence and no speculation.".to_string(),
+        },
+        ChatMessage {
+            role: "user".to_string(),
+            content: format!(
+                "Query:\n{query}\n\nRecent context that must be kept:\n{recent}\n\nChunk analyses:\n{}\n\nReturn plain text with sections:\n1) Most relevant evidence\n2) Likely failure chain\n3) Files/commands to inspect first",
+                chunk_notes.join("\n\n")
+            ),
+        },
+    ];
+    let synthesis =
+        match call_llm_with_messages(&state.cfg, provider, selector_model, &synthesis_messages) {
+            Ok(text) => text,
+            Err(err) => {
+                eprintln!("llm-select synthesis failed: {err}");
+                return None;
+            }
+        };
+
+    let max_chars = req.context_max_chars.unwrap_or(9000).clamp(240, 24_000);
+    let packed = format!(
+        "Session: {session_id}\nContext mode: llm-select\nQuery: {}\n\nRecent stdout/stderr/stdin (always included):\n{}\n\nLLM-selected relevant context:\n{}",
+        truncate_text_chars(query, 500),
+        recent,
+        synthesis
+    );
+    Some(truncate_text_chars(&packed, max_chars))
+}
+
+fn render_recent_context_block(corpus: &log_index::LlmSelectionCorpus) -> String {
+    let mut lines = Vec::new();
+    if !corpus.last_stdout.is_empty() {
+        lines.push("Last stdout:".to_string());
+        for line in &corpus.last_stdout {
+            lines.push(format!("- {}", truncate_text_chars(line, 220)));
+        }
+    }
+    if !corpus.last_stderr.is_empty() {
+        lines.push("Last stderr:".to_string());
+        for line in &corpus.last_stderr {
+            lines.push(format!("- {}", truncate_text_chars(line, 220)));
+        }
+    }
+    if !corpus.last_stdin.is_empty() {
+        lines.push("Last stdin:".to_string());
+        for line in &corpus.last_stdin {
+            lines.push(format!("- {}", truncate_text_chars(line, 220)));
+        }
+    }
+    if lines.is_empty() {
+        "none".to_string()
+    } else {
+        lines.join("\n")
+    }
+}
+
+fn truncate_text_chars(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    format!("{}...", text.chars().take(max_chars).collect::<String>())
 }
 
 fn completion_query_text(req: &CompletionRequest) -> String {
@@ -805,9 +983,13 @@ async fn ingest_logs_session(
 struct ContextDebugQuery {
     q: Option<String>,
     query: Option<String>,
+    intent: Option<String>,
     max_lines: Option<usize>,
     max_chars: Option<usize>,
     output_window: Option<usize>,
+    max_incidents: Option<usize>,
+    include_artifacts: Option<bool>,
+    explain: Option<bool>,
 }
 
 async fn get_logs_context(
@@ -823,6 +1005,13 @@ async fn get_logs_context(
         max_lines: params.max_lines.unwrap_or(120).clamp(20, 400),
         max_chars: params.max_chars.unwrap_or(4500).clamp(120, 20000),
         output_window: params.output_window.unwrap_or(1).clamp(0, 5),
+        max_incidents: params.max_incidents.unwrap_or(6).clamp(1, 16),
+        intent_override: params
+            .intent
+            .as_deref()
+            .and_then(log_index::QueryIntent::from_str),
+        include_artifacts: params.include_artifacts.unwrap_or(true),
+        explain: params.explain.unwrap_or(false),
         ..log_index::BuildContextOptions::default()
     };
 
@@ -2017,9 +2206,17 @@ fn call_llm_with_messages(
         messages: Some(messages.to_vec()),
         session_id: None,
         context_mode: None,
+        context_intent: None,
         context_max_lines: None,
         context_max_chars: None,
         context_output_window: None,
+        context_max_incidents: None,
+        context_include_artifacts: None,
+        context_explain: None,
+        context_selector_chunk_tokens: None,
+        context_selector_max_chunks: None,
+        context_selector_include_events: None,
+        context_selector_model: None,
         model: Some(model.clone()),
         provider: provider_name,
         max_tokens: None,
@@ -3141,6 +3338,25 @@ mod tests {
         assert_eq!(store.sessions.len(), 1);
         assert_eq!(store.agents.len(), 1);
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn parse_context_mode_supports_llm_select() {
+        assert_eq!(
+            parse_context_mode(Some("llm-select")),
+            ContextMode::LlmSelect
+        );
+        assert_eq!(
+            parse_context_mode(Some("llm_select")),
+            ContextMode::LlmSelect
+        );
+        assert_eq!(parse_context_mode(Some("selector")), ContextMode::LlmSelect);
+    }
+
+    #[test]
+    fn truncate_text_chars_adds_ellipsis_when_needed() {
+        assert_eq!(truncate_text_chars("abc", 10), "abc");
+        assert_eq!(truncate_text_chars("abcdef", 3), "abc...");
     }
 }
 

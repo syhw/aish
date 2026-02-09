@@ -5,51 +5,28 @@
     "options": {
       "max_lines": 120,
       "max_chars": 3500,
-      "output_window": 1
+      "output_window": 1,
+      "max_incidents": 6
     },
     "logs": {
       "events": [
-        {
-          "kind": "command.start",
-          "data": {
-            "cmd": "cargo test"
-          }
-        },
-        {
-          "kind": "command.end",
-          "data": {
-            "exit": 101
-          }
-        },
-        {
-          "kind": "tool.end",
-          "data": {
-            "tool": "shell",
-            "ok": false,
-            "error": "build failed"
-          }
-        }
+        {"kind": "command.start", "data": {"cmd": "cargo test"}},
+        {"kind": "command.end", "data": {"exit": 101}},
+        {"kind": "tool.end", "data": {"tool": "shell", "ok": false, "error": "build failed"}}
       ],
-      "stdin": [
-        "cargo test",
-        "git status"
-      ],
+      "stdin": ["cargo test", "git status"],
       "stderr": [
         "error[E0425]: cannot find value `foo` in this scope",
         "thread 'main' panicked at src/lib.rs:10:1"
       ]
     },
     "expect": {
-      "must_contain": [
-        "cargo test -> exit 101",
-        "error[E0425]",
-        "build failed"
-      ],
-      "must_have_categories": [
-        "failure.command",
-        "output"
-      ],
-      "min_evidence": 3,
+      "must_contain": ["cargo test -> exit 101", "error[E0425]", "build failed"],
+      "must_have_categories": ["failure.command", "output", "incident"],
+      "intent": "debug",
+      "min_incidents": 1,
+      "min_artifacts": 1,
+      "min_evidence": 4,
       "max_context_chars": 3500
     }
   },
@@ -59,49 +36,24 @@
     "options": {
       "max_lines": 120,
       "max_chars": 2800,
-      "output_window": 0
+      "output_window": 0,
+      "max_incidents": 5
     },
     "logs": {
       "events": [
-        {
-          "kind": "tool.start",
-          "data": {
-            "tool": "fs.write",
-            "args": {
-              "path": "src/main.rs",
-              "append": false,
-              "content": "fn main(){}"
-            }
-          }
-        },
-        {
-          "kind": "tool.start",
-          "data": {
-            "tool": "fs.write",
-            "args": {
-              "path": "README.md",
-              "append": true,
-              "content": "notes"
-            }
-          }
-        }
+        {"kind": "tool.start", "data": {"tool": "fs.write", "args": {"path": "src/main.rs", "append": false, "content": "fn main(){}"}}},
+        {"kind": "tool.start", "data": {"tool": "fs.write", "args": {"path": "README.md", "append": true, "content": "notes"}}}
       ],
-      "stdin": [
-        "llm which files changed"
-      ],
-      "stdout": [
-        "done"
-      ]
+      "stdin": ["llm which files changed"],
+      "stdout": ["done"]
     },
     "expect": {
-      "must_contain": [
-        "src/main.rs (overwrite)",
-        "README.md (append)"
-      ],
-      "must_have_categories": [
-        "edit"
-      ],
-      "min_evidence": 2,
+      "must_contain": ["src/main.rs", "README.md"],
+      "must_have_categories": ["edit", "artifact"],
+      "intent": "what-changed",
+      "min_incidents": 1,
+      "min_artifacts": 2,
+      "min_evidence": 3,
       "max_context_chars": 2800
     }
   },
@@ -111,33 +63,214 @@
     "options": {
       "max_lines": 120,
       "max_chars": 180,
+      "output_window": 1,
+      "max_incidents": 4
+    },
+    "logs": {
+      "events": [
+        {"kind": "command.start", "data": {"cmd": "cargo test --workspace --all-features"}},
+        {"kind": "command.end", "data": {"exit": 101}}
+      ],
+      "stderr": ["error: synthetic long error for budget testing and retrieval truncation"]
+    },
+    "expect": {
+      "must_have_categories": ["failure.command", "incident"],
+      "intent": "debug",
+      "min_evidence": 2,
+      "max_context_chars": 180
+    }
+  },
+  {
+    "name": "resume-after-failure",
+    "query": "resume from where we left off",
+    "options": {"max_lines": 140, "max_chars": 4200, "output_window": 1, "max_incidents": 8},
+    "logs": {
+      "events": [
+        {"kind": "command.start", "data": {"cmd": "pytest -q"}},
+        {"kind": "command.end", "data": {"exit": 1}},
+        {"kind": "tool.start", "data": {"tool": "fs.write", "args": {"path": "app.py", "append": false, "content": "print('fix')"}}},
+        {"kind": "tool.end", "data": {"tool": "shell", "ok": false, "error": "tests still failing"}}
+      ],
+      "stdin": ["pytest -q", "python3 -m unittest -q"],
+      "stderr": ["FAILED test_app.py::test_logic - AssertionError"]
+    },
+    "expect": {
+      "must_contain": ["pytest -q", "tests still failing", "app.py"],
+      "intent": "resume",
+      "must_have_categories": ["incident", "artifact"],
+      "min_incidents": 1,
+      "min_artifacts": 2,
+      "min_evidence": 4
+    }
+  },
+  {
+    "name": "status-overview",
+    "query": "give me status summary",
+    "options": {"max_lines": 120, "max_chars": 3000, "output_window": 0},
+    "logs": {
+      "stdin": ["git status", "cargo check"],
+      "stdout": ["On branch main", "Finished dev profile"],
+      "events": [
+        {"kind": "command.start", "data": {"cmd": "cargo check"}},
+        {"kind": "command.end", "data": {"exit": 0}}
+      ]
+    },
+    "expect": {
+      "intent": "status",
+      "must_contain": ["cargo check", "On branch main"],
+      "min_incidents": 1,
+      "min_evidence": 1
+    }
+  },
+  {
+    "name": "intent-override-debug",
+    "query": "show me a concise recap",
+    "options": {
+      "intent": "debug",
+      "explain": true,
+      "max_lines": 120,
+      "max_chars": 3200,
+      "output_window": 1,
+      "max_incidents": 6
+    },
+    "logs": {
+      "events": [
+        {"kind": "command.start", "data": {"cmd": "go test ./..."}},
+        {"kind": "command.end", "data": {"exit": 1}}
+      ],
+      "stderr": ["panic: nil pointer dereference"]
+    },
+    "expect": {
+      "intent": "debug",
+      "explain": true,
+      "must_contain": ["panic", "go test ./..."],
+      "min_incidents": 1,
+      "min_evidence": 2
+    }
+  },
+  {
+    "name": "intent-override-status",
+    "query": "what failed here?",
+    "options": {
+      "intent": "status",
+      "max_lines": 120,
+      "max_chars": 3200,
       "output_window": 1
     },
     "logs": {
       "events": [
-        {
-          "kind": "command.start",
-          "data": {
-            "cmd": "cargo test --workspace --all-features"
-          }
-        },
-        {
-          "kind": "command.end",
-          "data": {
-            "exit": 101
-          }
-        }
+        {"kind": "command.start", "data": {"cmd": "npm test"}},
+        {"kind": "command.end", "data": {"exit": 1}}
       ],
-      "stderr": [
-        "error: synthetic long error for budget testing and retrieval truncation"
+      "stderr": ["Error: expected 200 to equal 500"]
+    },
+    "expect": {
+      "intent": "status",
+      "min_evidence": 2,
+      "min_incidents": 1
+    }
+  },
+  {
+    "name": "tool-failure-logged",
+    "query": "why did file write fail",
+    "options": {"max_lines": 120, "max_chars": 3200, "output_window": 1},
+    "logs": {
+      "events": [
+        {"kind": "tool.end", "data": {"tool": "fs.write", "ok": false, "error": "permission denied"}},
+        {"kind": "command.start", "data": {"cmd": "python3 script.py"}},
+        {"kind": "command.end", "data": {"exit": 1}}
+      ],
+      "stderr": ["permission denied"]
+    },
+    "expect": {
+      "intent": "debug",
+      "must_contain": ["permission denied", "fs.write"],
+      "must_have_categories": ["failure.tool", "artifact"],
+      "min_artifacts": 1,
+      "min_evidence": 3
+    }
+  },
+  {
+    "name": "incident-includes-neighbor-output",
+    "query": "debug token_match_failure",
+    "options": {"max_lines": 120, "max_chars": 3600, "output_window": 1},
+    "logs": {
+      "events": [
+        {"kind": "command.start", "data": {"cmd": "cargo run"}},
+        {"kind": "command.end", "data": {"exit": 101}}
+      ],
+      "output": [
+        "build started",
+        "TOKEN_MATCH_FAILURE",
+        "hint: check imports"
       ]
     },
     "expect": {
-      "must_have_categories": [
-        "failure.command"
+      "intent": "debug",
+      "must_contain": ["build started", "TOKEN_MATCH_FAILURE", "hint: check imports"],
+      "min_incidents": 1,
+      "min_evidence": 3
+    }
+  },
+  {
+    "name": "artifacts-track-edits",
+    "query": "resume and tell me what changed",
+    "options": {"max_lines": 120, "max_chars": 3600, "output_window": 0},
+    "logs": {
+      "events": [
+        {"kind": "tool.start", "data": {"tool": "fs.write", "args": {"path": "src/config.rs", "append": false, "content": "x"}}},
+        {"kind": "tool.start", "data": {"tool": "fs.write", "args": {"path": "src/main.rs", "append": true, "content": "y"}}},
+        {"kind": "command.start", "data": {"cmd": "cargo test"}},
+        {"kind": "command.end", "data": {"exit": 101}}
+      ]
+    },
+    "expect": {
+      "intent": "resume",
+      "must_contain": ["src/config.rs", "src/main.rs"],
+      "min_artifacts": 2,
+      "min_incidents": 1,
+      "min_evidence": 3
+    }
+  },
+  {
+    "name": "explain-disabled-by-default",
+    "query": "why did this fail",
+    "options": {"max_lines": 120, "max_chars": 3000, "output_window": 1},
+    "logs": {
+      "events": [
+        {"kind": "command.start", "data": {"cmd": "make test"}},
+        {"kind": "command.end", "data": {"exit": 2}}
       ],
-      "min_evidence": 1,
-      "max_context_chars": 180
+      "stderr": ["error: target not found"]
+    },
+    "expect": {
+      "intent": "debug",
+      "explain": false,
+      "min_evidence": 2
+    }
+  },
+  {
+    "name": "diagnostic-with-artifacts-disabled",
+    "query": "what went wrong",
+    "options": {
+      "max_lines": 120,
+      "max_chars": 3200,
+      "output_window": 1,
+      "include_artifacts": false
+    },
+    "logs": {
+      "events": [
+        {"kind": "command.start", "data": {"cmd": "cargo clippy"}},
+        {"kind": "command.end", "data": {"exit": 1}},
+        {"kind": "tool.start", "data": {"tool": "fs.write", "args": {"path": "src/lib.rs", "append": false, "content": "x"}}}
+      ],
+      "stderr": ["error: unused variable: x"]
+    },
+    "expect": {
+      "intent": "debug",
+      "must_have_categories": ["failure.command", "incident"],
+      "min_evidence": 2,
+      "max_context_chars": 3200
     }
   }
 ]
