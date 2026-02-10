@@ -20,6 +20,7 @@ pub struct ContextBundle {
     pub session_id: String,
     pub query: String,
     pub intent: String,
+    pub retriever: String,
     pub query_tokens: Vec<String>,
     pub incidents: Vec<IncidentItem>,
     pub artifacts: Vec<ArtifactItem>,
@@ -99,6 +100,10 @@ pub struct ContextExplain {
 pub struct ContextProfileExplain {
     pub max_evidence: usize,
     pub max_incidents: usize,
+    pub retriever: String,
+    pub hybrid_lexical_weight: f32,
+    pub hybrid_bm25_weight: f32,
+    pub hybrid_embedding_weight: f32,
     pub category_caps: HashMap<String, usize>,
 }
 
@@ -134,6 +139,54 @@ impl QueryIntent {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+pub enum RetrievalStrategy {
+    Lexical,
+    Bm25,
+    Hybrid,
+}
+
+impl RetrievalStrategy {
+    pub fn from_str(value: &str) -> Option<Self> {
+        match value.trim().to_lowercase().as_str() {
+            "lexical" => Some(Self::Lexical),
+            "bm25" => Some(Self::Bm25),
+            "hybrid" => Some(Self::Hybrid),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Lexical => "lexical",
+            Self::Bm25 => "bm25",
+            Self::Hybrid => "hybrid",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RetrievalLedgerEntry {
+    pub ts_ms: i64,
+    pub session_id: String,
+    pub query: String,
+    pub context_mode: String,
+    pub retriever: String,
+    pub intent: Option<String>,
+    pub model: Option<String>,
+    pub provider: Option<String>,
+    pub selector_used: bool,
+    pub selector_chunks: usize,
+    pub fallback_used: bool,
+    pub context_chars: usize,
+    pub answer_chars: usize,
+    pub status: String,
+    pub error: Option<String>,
+    pub selected_evidence_json: Option<String>,
+    pub context_text: Option<String>,
+    pub answer_text: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct BuildContextOptions {
     pub max_lines: usize,
@@ -144,6 +197,10 @@ pub struct BuildContextOptions {
     pub intent_override: Option<QueryIntent>,
     pub include_artifacts: bool,
     pub explain: bool,
+    pub retriever: RetrievalStrategy,
+    pub hybrid_lexical_weight: f32,
+    pub hybrid_bm25_weight: f32,
+    pub hybrid_embedding_weight: f32,
 }
 
 impl Default for BuildContextOptions {
@@ -157,6 +214,10 @@ impl Default for BuildContextOptions {
             intent_override: None,
             include_artifacts: true,
             explain: false,
+            retriever: RetrievalStrategy::Lexical,
+            hybrid_lexical_weight: 0.45,
+            hybrid_bm25_weight: 0.35,
+            hybrid_embedding_weight: 0.20,
         }
     }
 }
@@ -275,6 +336,30 @@ pub fn init(db_path: &Path) -> Result<(), String> {
         );
         CREATE INDEX IF NOT EXISTS idx_context_artifacts_session_updated
             ON context_artifacts(session_id, updated_at_ms DESC);
+
+        CREATE TABLE IF NOT EXISTS context_retrieval_ledger (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts_ms INTEGER NOT NULL,
+            session_id TEXT NOT NULL,
+            query TEXT NOT NULL,
+            context_mode TEXT NOT NULL,
+            retriever TEXT NOT NULL,
+            intent TEXT,
+            model TEXT,
+            provider TEXT,
+            selector_used INTEGER NOT NULL DEFAULT 0,
+            selector_chunks INTEGER NOT NULL DEFAULT 0,
+            fallback_used INTEGER NOT NULL DEFAULT 0,
+            context_chars INTEGER NOT NULL DEFAULT 0,
+            answer_chars INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL,
+            error TEXT,
+            selected_evidence_json TEXT,
+            context_text TEXT,
+            answer_text TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_context_retrieval_ledger_session_ts
+            ON context_retrieval_ledger(session_id, ts_ms DESC);
         ",
     )
     .map_err(|err| err.to_string())?;
@@ -315,6 +400,41 @@ pub fn ingest_session(
 pub fn append_event(db_path: &Path, event: &Value) -> Result<IngestStats, String> {
     let conn = open_conn(db_path)?;
     insert_event(&conn, event, None, None, None)
+}
+
+pub fn append_retrieval_ledger(db_path: &Path, entry: &RetrievalLedgerEntry) -> Result<(), String> {
+    let conn = open_conn(db_path)?;
+    conn.execute(
+        "
+        INSERT INTO context_retrieval_ledger (
+            ts_ms, session_id, query, context_mode, retriever, intent, model, provider,
+            selector_used, selector_chunks, fallback_used, context_chars, answer_chars, status, error,
+            selected_evidence_json, context_text, answer_text
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
+        ",
+        params![
+            entry.ts_ms,
+            entry.session_id,
+            entry.query,
+            entry.context_mode,
+            entry.retriever,
+            entry.intent,
+            entry.model,
+            entry.provider,
+            if entry.selector_used { 1 } else { 0 },
+            entry.selector_chunks as i64,
+            if entry.fallback_used { 1 } else { 0 },
+            entry.context_chars as i64,
+            entry.answer_chars as i64,
+            entry.status,
+            entry.error,
+            entry.selected_evidence_json,
+            entry.context_text,
+            entry.answer_text,
+        ],
+    )
+    .map_err(|err| err.to_string())?;
+    Ok(())
 }
 
 pub fn upsert_session(
@@ -488,6 +608,7 @@ pub fn build_relevant_context_bundle_with_options(
         &tokens,
         profile.artifact_weight,
     ));
+    let candidates = apply_retriever_ranking(candidates, &tokens, options);
 
     let candidate_count = candidates.len();
     let selected = select_candidates(candidates, options.max_evidence.max(8), profile);
@@ -523,6 +644,7 @@ pub fn build_relevant_context_bundle_with_options(
         session_id: session_id.to_string(),
         query: query.to_string(),
         intent: intent.as_str().to_string(),
+        retriever: options.retriever.as_str().to_string(),
         query_tokens: tokens,
         incidents: incidents
             .into_iter()
@@ -560,6 +682,10 @@ pub fn build_relevant_context_bundle_with_options(
             profile: ContextProfileExplain {
                 max_evidence: options.max_evidence.max(8),
                 max_incidents: profile.max_incidents,
+                retriever: options.retriever.as_str().to_string(),
+                hybrid_lexical_weight: options.hybrid_lexical_weight,
+                hybrid_bm25_weight: options.hybrid_bm25_weight,
+                hybrid_embedding_weight: options.hybrid_embedding_weight,
                 category_caps: profile.category_caps_map(),
             },
         });
@@ -801,6 +927,7 @@ fn render_context_text(bundle: &ContextBundle, options: BuildContextOptions) -> 
     let mut lines = Vec::new();
     lines.push(format!("Session: {}", bundle.session_id));
     lines.push(format!("Intent: {}", bundle.intent));
+    lines.push(format!("Retriever: {}", bundle.retriever));
     lines.push(format!("Query: {}", truncate_line(&bundle.query, 220)));
 
     if !bundle.incidents.is_empty() {
@@ -875,7 +1002,7 @@ fn render_context_text(bundle: &ContextBundle, options: BuildContextOptions) -> 
         }
     }
 
-    if lines.len() <= 2 {
+    if lines.len() <= 4 {
         lines.push("No relevant indexed shell context was found.".to_string());
     }
 
@@ -1526,6 +1653,199 @@ fn score_artifacts(
             }
         })
         .collect()
+}
+
+fn apply_retriever_ranking(
+    mut candidates: Vec<ScoredCandidate>,
+    query_tokens: &[String],
+    options: BuildContextOptions,
+) -> Vec<ScoredCandidate> {
+    if candidates.is_empty() || query_tokens.is_empty() || options.retriever == RetrievalStrategy::Lexical
+    {
+        return candidates;
+    }
+
+    let bm25_scores = bm25_scores_by_index(&candidates, query_tokens);
+    let emb_scores = embedding_scores_by_index(&candidates, query_tokens);
+    let max_lex = candidates
+        .iter()
+        .map(|item| item.score.max(0.0))
+        .fold(0.0f32, f32::max);
+    let max_bm25 = bm25_scores.iter().copied().fold(0.0f32, f32::max);
+    let (w_lex, w_bm25, w_emb) = normalized_hybrid_weights(options);
+
+    for (idx, item) in candidates.iter_mut().enumerate() {
+        let lex_norm = if max_lex > 0.0 {
+            (item.score.max(0.0) / max_lex).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let bm_norm = if max_bm25 > 0.0 {
+            (bm25_scores[idx] / max_bm25).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let emb_norm = ((emb_scores[idx] + 1.0) / 2.0).clamp(0.0, 1.0);
+        let prior = category_priority(item.category);
+
+        match options.retriever {
+            RetrievalStrategy::Lexical => {}
+            RetrievalStrategy::Bm25 => {
+                item.score = bm_norm * 10.0 + lex_norm * 1.5 + prior;
+                item.reasons.push(format!("bm25={:.2}", bm_norm));
+                item.reasons.push(format!("embed={:.2}", emb_norm));
+            }
+            RetrievalStrategy::Hybrid => {
+                let hybrid_norm = lex_norm * w_lex + bm_norm * w_bm25 + emb_norm * w_emb;
+                item.score = hybrid_norm * 12.0 + prior;
+                item.reasons.push(format!(
+                    "hybrid lex={:.2} bm25={:.2} emb={:.2}",
+                    lex_norm, bm_norm, emb_norm
+                ));
+            }
+        }
+    }
+
+    candidates
+}
+
+fn normalized_hybrid_weights(options: BuildContextOptions) -> (f32, f32, f32) {
+    let lex = options.hybrid_lexical_weight.max(0.0);
+    let bm = options.hybrid_bm25_weight.max(0.0);
+    let emb = options.hybrid_embedding_weight.max(0.0);
+    let sum = lex + bm + emb;
+    if sum <= 0.0 {
+        return (0.45, 0.35, 0.20);
+    }
+    (lex / sum, bm / sum, emb / sum)
+}
+
+fn category_priority(category: &str) -> f32 {
+    match category {
+        "failure.command" => 1.6,
+        "failure.tool" => 1.4,
+        "incident" => 1.2,
+        "output" => 0.9,
+        "command" => 0.7,
+        "artifact" => 0.6,
+        "edit" => 0.5,
+        _ => 0.0,
+    }
+}
+
+fn bm25_scores_by_index(candidates: &[ScoredCandidate], query_tokens: &[String]) -> Vec<f32> {
+    if candidates.is_empty() || query_tokens.is_empty() {
+        return vec![0.0; candidates.len()];
+    }
+    let docs = candidates
+        .iter()
+        .map(|item| tokenize_doc_terms(&item.text))
+        .collect::<Vec<_>>();
+    let n_docs = docs.len() as f32;
+    let avgdl = (docs.iter().map(|doc| doc.len()).sum::<usize>() as f32 / n_docs).max(1.0);
+    let unique_q = query_tokens.iter().cloned().collect::<HashSet<_>>();
+
+    let mut idf = HashMap::new();
+    for token in unique_q {
+        let df = docs.iter().filter(|doc| doc.contains(&token)).count() as f32;
+        let score = ((n_docs - df + 0.5) / (df + 0.5) + 1.0).ln();
+        idf.insert(token, score.max(0.0));
+    }
+
+    let k1 = 1.5f32;
+    let b = 0.75f32;
+    docs.iter()
+        .map(|doc| {
+            let dl = doc.len() as f32;
+            let mut tf = HashMap::<&str, usize>::new();
+            for token in doc {
+                *tf.entry(token.as_str()).or_insert(0) += 1;
+            }
+            let mut score = 0.0f32;
+            for (token, idf_score) in &idf {
+                let freq = *tf.get(token.as_str()).unwrap_or(&0) as f32;
+                if freq <= 0.0 {
+                    continue;
+                }
+                let numerator = freq * (k1 + 1.0);
+                let denominator = freq + k1 * (1.0 - b + b * (dl / avgdl));
+                score += idf_score * (numerator / denominator);
+            }
+            score
+        })
+        .collect()
+}
+
+fn embedding_scores_by_index(candidates: &[ScoredCandidate], query_tokens: &[String]) -> Vec<f32> {
+    if candidates.is_empty() || query_tokens.is_empty() {
+        return vec![0.0; candidates.len()];
+    }
+    let query_vec = hashed_embedding(query_tokens, 128);
+    candidates
+        .iter()
+        .map(|item| {
+            let doc_tokens = tokenize_doc_terms(&item.text);
+            if doc_tokens.is_empty() {
+                return 0.0;
+            }
+            let doc_vec = hashed_embedding(&doc_tokens, 128);
+            cosine_similarity(&query_vec, &doc_vec)
+        })
+        .collect()
+}
+
+fn tokenize_doc_terms(text: &str) -> Vec<String> {
+    text.split(|c: char| !c.is_ascii_alphanumeric())
+        .filter_map(|raw| {
+            let token = raw.trim().to_lowercase();
+            if token.len() < 2 {
+                None
+            } else {
+                Some(token)
+            }
+        })
+        .collect()
+}
+
+fn hashed_embedding(tokens: &[String], dims: usize) -> Vec<f32> {
+    let mut vec = vec![0.0f32; dims.max(8)];
+    if tokens.is_empty() {
+        return vec;
+    }
+    for token in tokens {
+        let h = stable_hash(token.as_bytes());
+        let idx = (h as usize) % vec.len();
+        let sign = if ((h >> 13) & 1) == 0 { 1.0 } else { -1.0 };
+        vec[idx] += sign;
+    }
+    let norm = vec.iter().map(|v| v * v).sum::<f32>().sqrt();
+    if norm > 0.0 {
+        for value in &mut vec {
+            *value /= norm;
+        }
+    }
+    vec
+}
+
+fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    let len = a.len().min(b.len());
+    if len == 0 {
+        return 0.0;
+    }
+    let mut dot = 0.0f32;
+    for i in 0..len {
+        dot += a[i] * b[i];
+    }
+    dot.clamp(-1.0, 1.0)
+}
+
+fn stable_hash(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 1469598103934665603;
+    for byte in bytes {
+        h ^= *byte as u64;
+        h = h.wrapping_mul(1099511628211);
+    }
+    h
 }
 
 fn query_tokens_for_incident(text: &str) -> Vec<String> {
@@ -2852,6 +3172,113 @@ mod tests {
     }
 
     #[test]
+    fn context_bundle_supports_bm25_and_hybrid_retrievers() {
+        let root = test_root("retrievers");
+        let session_id = "sess_test_retrievers";
+        let session_dir = root.join(session_id);
+        fs::create_dir_all(&session_dir).unwrap();
+
+        write_file(
+            &session_dir.join("stdout.log"),
+            "cargo build failed at parser module\ncargo build failed with parser panic\n",
+        );
+        write_file(
+            &session_dir.join("stderr.log"),
+            "error: parser failure in module foo\n",
+        );
+
+        let db_path = root.join("logs.sqlite");
+        init(&db_path).unwrap();
+        ingest_session(&root, &db_path, session_id).unwrap();
+
+        let bm25_bundle = build_relevant_context_bundle_with_options(
+            &db_path,
+            session_id,
+            "parser failure",
+            BuildContextOptions {
+                retriever: RetrievalStrategy::Bm25,
+                ..BuildContextOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(bm25_bundle.retriever, "bm25");
+        assert!(
+            bm25_bundle
+                .selected_evidence
+                .iter()
+                .flat_map(|item| item.reasons.iter())
+                .any(|reason| reason.contains("bm25"))
+        );
+
+        let hybrid_bundle = build_relevant_context_bundle_with_options(
+            &db_path,
+            session_id,
+            "parser failure",
+            BuildContextOptions {
+                retriever: RetrievalStrategy::Hybrid,
+                ..BuildContextOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(hybrid_bundle.retriever, "hybrid");
+        assert!(
+            hybrid_bundle
+                .selected_evidence
+                .iter()
+                .flat_map(|item| item.reasons.iter())
+                .any(|reason| reason.contains("hybrid"))
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn append_retrieval_ledger_persists_rows() {
+        let root = test_root("retrieval_ledger");
+        let db_path = root.join("logs.sqlite");
+        init(&db_path).unwrap();
+
+        append_retrieval_ledger(
+            &db_path,
+            &RetrievalLedgerEntry {
+                ts_ms: 1234,
+                session_id: "sess_test_ledger".to_string(),
+                query: "why did this fail".to_string(),
+                context_mode: "always".to_string(),
+                retriever: "hybrid".to_string(),
+                intent: Some("debug".to_string()),
+                model: Some("gpt-test".to_string()),
+                provider: Some("default".to_string()),
+                selector_used: true,
+                selector_chunks: 3,
+                fallback_used: false,
+                context_chars: 321,
+                answer_chars: 111,
+                status: "ok".to_string(),
+                error: None,
+                selected_evidence_json: Some("[{\"category\":\"output\"}]".to_string()),
+                context_text: Some("ctx".to_string()),
+                answer_text: Some("ans".to_string()),
+            },
+        )
+        .unwrap();
+
+        let conn = Connection::open(&db_path).unwrap();
+        let (count, retriever, selector_chunks): (i64, String, i64) = conn
+            .query_row(
+                "SELECT COUNT(*), MAX(retriever), MAX(selector_chunks) FROM context_retrieval_ledger WHERE session_id = ?1",
+                params!["sess_test_ledger"],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(retriever, "hybrid");
+        assert_eq!(selector_chunks, 3);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn context_bundle_honors_intent_override() {
         let root = test_root("intent_override");
         let session_id = "sess_test_intent_override";
@@ -2957,6 +3384,126 @@ mod tests {
             corpus.old_context_chunks[0].contains("truncated")
                 || corpus.old_context_chunks[0].chars().count() <= 64
         );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn normalized_hybrid_weights_fallback_when_all_zero() {
+        let options = BuildContextOptions {
+            retriever: RetrievalStrategy::Hybrid,
+            hybrid_lexical_weight: 0.0,
+            hybrid_bm25_weight: 0.0,
+            hybrid_embedding_weight: 0.0,
+            ..BuildContextOptions::default()
+        };
+        let (lex, bm25, emb) = normalized_hybrid_weights(options);
+        assert!((lex - 0.45).abs() < 0.0001);
+        assert!((bm25 - 0.35).abs() < 0.0001);
+        assert!((emb - 0.20).abs() < 0.0001);
+    }
+
+    #[test]
+    fn context_bundle_respects_max_evidence_cap() {
+        let root = test_root("max_evidence");
+        let session_id = "sess_test_max_evidence";
+        let session_dir = root.join(session_id);
+        fs::create_dir_all(&session_dir).unwrap();
+
+        let mut out = String::new();
+        for i in 0..80 {
+            out.push_str(&format!("error line {i} with parser failure\n"));
+        }
+        write_file(&session_dir.join("stderr.log"), &out);
+
+        let db_path = root.join("logs.sqlite");
+        init(&db_path).unwrap();
+        ingest_session(&root, &db_path, session_id).unwrap();
+
+        let bundle = build_relevant_context_bundle_with_options(
+            &db_path,
+            session_id,
+            "parser failure",
+            BuildContextOptions {
+                max_evidence: 8,
+                ..BuildContextOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(bundle.selected_evidence.len() <= 8);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn context_bundle_excludes_artifacts_when_disabled() {
+        let root = test_root("no_artifacts");
+        let session_id = "sess_test_no_artifacts";
+        let session_dir = root.join(session_id);
+        fs::create_dir_all(&session_dir).unwrap();
+
+        write_file(
+            &session_dir.join("events.jsonl"),
+            "{\"ts_ms\":41,\"session_id\":\"sess_test_no_artifacts\",\"kind\":\"tool.start\",\"data\":{\"tool\":\"fs.write\",\"args\":{\"path\":\"src/lib.rs\",\"content\":\"x\"}}}\n",
+        );
+
+        let db_path = root.join("logs.sqlite");
+        init(&db_path).unwrap();
+        ingest_session(&root, &db_path, session_id).unwrap();
+
+        let with_artifacts = build_relevant_context_bundle_with_options(
+            &db_path,
+            session_id,
+            "what changed?",
+            BuildContextOptions::default(),
+        )
+        .unwrap();
+        assert!(!with_artifacts.artifacts.is_empty());
+
+        let without_artifacts = build_relevant_context_bundle_with_options(
+            &db_path,
+            session_id,
+            "what changed?",
+            BuildContextOptions {
+                include_artifacts: false,
+                ..BuildContextOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(without_artifacts.artifacts.is_empty());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn llm_selection_corpus_can_skip_events() {
+        let root = test_root("llm_no_events");
+        let session_id = "sess_test_llm_no_events";
+        let session_dir = root.join(session_id);
+        fs::create_dir_all(&session_dir).unwrap();
+
+        write_file(
+            &session_dir.join("events.jsonl"),
+            "{\"ts_ms\":1,\"session_id\":\"sess_test_llm_no_events\",\"kind\":\"command.start\",\"data\":{\"cmd\":\"cargo test\"}}\n",
+        );
+        write_file(&session_dir.join("stdin.log"), "echo hi\n");
+
+        let db_path = root.join("logs.sqlite");
+        init(&db_path).unwrap();
+        ingest_session(&root, &db_path, session_id).unwrap();
+
+        let corpus = build_llm_selection_corpus(
+            &db_path,
+            session_id,
+            BuildLlmSelectionCorpusOptions {
+                chunk_chars: 200,
+                max_chunks: 4,
+                include_events: false,
+            },
+        )
+        .unwrap();
+        let joined = corpus.old_context_chunks.join("\n");
+        assert!(!joined.contains("### EVENTS"));
 
         let _ = fs::remove_dir_all(root);
     }

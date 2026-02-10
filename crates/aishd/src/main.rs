@@ -20,7 +20,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -165,7 +165,7 @@ async fn version() -> Json<Version> {
     })
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 struct CompletionRequest {
     prompt: Option<String>,
     messages: Option<Vec<ChatMessage>>,
@@ -178,8 +178,15 @@ struct CompletionRequest {
     context_max_incidents: Option<usize>,
     context_include_artifacts: Option<bool>,
     context_explain: Option<bool>,
+    context_retriever: Option<String>,
+    context_hybrid_lexical_weight: Option<f32>,
+    context_hybrid_bm25_weight: Option<f32>,
+    context_hybrid_embedding_weight: Option<f32>,
     context_selector_chunk_tokens: Option<usize>,
     context_selector_max_chunks: Option<usize>,
+    context_selector_total_tokens_cap: Option<usize>,
+    context_selector_timeout_ms: Option<u64>,
+    context_selector_early_stop: Option<bool>,
     context_selector_include_events: Option<bool>,
     context_selector_model: Option<String>,
     model: Option<String>,
@@ -291,7 +298,10 @@ async fn completions(
     Json(req): Json<CompletionRequest>,
 ) -> Response {
     let mut req = req;
-    maybe_inject_completion_context(&state, &mut req);
+    let requested_mode = parse_context_mode(req.context_mode.as_deref());
+    let session_for_ledger = req.session_id.clone();
+    let query_for_ledger = completion_query_text(&req);
+    let injected_context = maybe_inject_completion_context(&state, &mut req);
 
     let cfg = &state.cfg;
     let mut model = req.model.clone().unwrap_or_default();
@@ -335,22 +345,78 @@ async fn completions(
         Err(resp) => return resp,
     };
     let provider = provider.clone();
+    let provider_for_ledger = provider_name.clone().unwrap_or_else(|| "default".to_string());
+    let model_for_ledger = model.clone();
+    let req_for_provider = req.clone();
     let result = tokio::task::spawn_blocking(move || {
-        call_openai_compat_completions(&provider, &api_key, &model, &req)
+        call_openai_compat_completions(&provider, &api_key, &model, &req_for_provider)
     })
     .await;
 
+    let should_log_ledger = requested_mode != ContextMode::Off
+        && session_for_ledger.is_some()
+        && !query_for_ledger.trim().is_empty();
+
     match result {
-        Ok(Ok(value)) => (StatusCode::OK, Json(value)).into_response(),
+        Ok(Ok(value)) => {
+            if should_log_ledger {
+                log_completion_retrieval_ledger(
+                    &state,
+                    session_for_ledger.as_deref().unwrap_or_default(),
+                    &query_for_ledger,
+                    requested_mode,
+                    &req,
+                    injected_context.as_ref(),
+                    Some(&value),
+                    "ok",
+                    None,
+                    &model_for_ledger,
+                    &provider_for_ledger,
+                );
+            }
+            (StatusCode::OK, Json(value)).into_response()
+        }
         Ok(Err((status, value))) => {
+            if should_log_ledger {
+                log_completion_retrieval_ledger(
+                    &state,
+                    session_for_ledger.as_deref().unwrap_or_default(),
+                    &query_for_ledger,
+                    requested_mode,
+                    &req,
+                    injected_context.as_ref(),
+                    None,
+                    "provider_error",
+                    Some(truncate_text_chars(&value.to_string(), 4_000)),
+                    &model_for_ledger,
+                    &provider_for_ledger,
+                );
+            }
             let status = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
             (status, Json(value)).into_response()
         }
-        Err(err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": format!("join error: {err}")})),
-        )
-            .into_response(),
+        Err(err) => {
+            if should_log_ledger {
+                log_completion_retrieval_ledger(
+                    &state,
+                    session_for_ledger.as_deref().unwrap_or_default(),
+                    &query_for_ledger,
+                    requested_mode,
+                    &req,
+                    injected_context.as_ref(),
+                    None,
+                    "join_error",
+                    Some(err.to_string()),
+                    &model_for_ledger,
+                    &provider_for_ledger,
+                );
+            }
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("join error: {err}")})),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -362,6 +428,17 @@ enum ContextMode {
     LlmSelect,
 }
 
+impl ContextMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Diagnostic => "diagnostic",
+            Self::Always => "always",
+            Self::LlmSelect => "llm-select",
+        }
+    }
+}
+
 fn parse_context_mode(value: Option<&str>) -> ContextMode {
     match value.unwrap_or("off").trim().to_lowercase().as_str() {
         "always" => ContextMode::Always,
@@ -371,31 +448,75 @@ fn parse_context_mode(value: Option<&str>) -> ContextMode {
     }
 }
 
-fn maybe_inject_completion_context(state: &AppState, req: &mut CompletionRequest) {
+#[derive(Debug, Clone)]
+struct InjectedContext {
+    context_text: String,
+    intent: Option<String>,
+    retriever: String,
+    selected_evidence_json: Option<String>,
+    selector_used: bool,
+    selector_chunks: usize,
+    fallback_used: bool,
+}
+
+#[derive(Debug, Clone)]
+struct LlmSelectedContext {
+    context_text: String,
+    selector_chunks: usize,
+}
+
+fn maybe_inject_completion_context(state: &AppState, req: &mut CompletionRequest) -> Option<InjectedContext> {
     let mode = parse_context_mode(req.context_mode.as_deref());
     if mode == ContextMode::Off {
-        return;
+        return None;
     }
     let session_id = match req.session_id.as_deref() {
         Some(id) => id,
-        None => return,
+        None => return None,
     };
     let query = completion_query_text(req);
     if query.trim().is_empty() {
-        return;
+        return None;
     }
     if mode == ContextMode::Diagnostic && !is_diagnostic_query(&query) {
-        return;
+        return None;
     }
 
-    let context = if mode == ContextMode::LlmSelect {
-        build_llm_selected_context(state, req, session_id, &query)
-            .or_else(|| deterministic_context_for_query(state, req, session_id, &query))
+    let selected = if mode == ContextMode::LlmSelect {
+        if let Some(selected) = build_llm_selected_context(state, req, session_id, &query) {
+            Some(InjectedContext {
+                context_text: selected.context_text,
+                intent: None,
+                retriever: "llm-select".to_string(),
+                selected_evidence_json: None,
+                selector_used: true,
+                selector_chunks: selected.selector_chunks,
+                fallback_used: false,
+            })
+        } else {
+            deterministic_context_for_query(state, req, session_id, &query).map(|bundle| InjectedContext {
+                context_text: bundle.context_text,
+                intent: Some(bundle.intent),
+                retriever: bundle.retriever,
+                selected_evidence_json: serde_json::to_string(&bundle.selected_evidence).ok(),
+                selector_used: true,
+                selector_chunks: 0,
+                fallback_used: true,
+            })
+        }
     } else {
-        deterministic_context_for_query(state, req, session_id, &query)
+        deterministic_context_for_query(state, req, session_id, &query).map(|bundle| InjectedContext {
+            context_text: bundle.context_text,
+            intent: Some(bundle.intent),
+            retriever: bundle.retriever,
+            selected_evidence_json: serde_json::to_string(&bundle.selected_evidence).ok(),
+            selector_used: false,
+            selector_chunks: 0,
+            fallback_used: false,
+        })
     };
-    let Some(context) = context else {
-        return;
+    let Some(selected) = selected else {
+        return None;
     };
 
     let system_msg = ChatMessage {
@@ -403,21 +524,23 @@ fn maybe_inject_completion_context(state: &AppState, req: &mut CompletionRequest
         content: format!(
             "Use this indexed shell/agent execution context when answering.\n\
              Prefer evidence from context and mention uncertainty when context is insufficient.\n\n{}",
-            context
+            selected.context_text.clone()
         ),
     };
 
     if let Some(messages) = req.messages.as_mut() {
         messages.insert(0, system_msg);
-        return;
+        return Some(selected);
     }
 
     if let Some(prompt) = req.prompt.as_mut() {
         *prompt = format!(
             "Execution context:\n{}\n\nUser request:\n{}",
-            context, prompt
+            selected.context_text.clone(),
+            prompt
         );
     }
+    Some(selected)
 }
 
 fn deterministic_context_for_query(
@@ -425,7 +548,12 @@ fn deterministic_context_for_query(
     req: &CompletionRequest,
     session_id: &str,
     query: &str,
-) -> Option<String> {
+) -> Option<log_index::ContextBundle> {
+    let retriever = req
+        .context_retriever
+        .as_deref()
+        .and_then(log_index::RetrievalStrategy::from_str)
+        .unwrap_or(log_index::RetrievalStrategy::Lexical);
     let options = log_index::BuildContextOptions {
         max_lines: req.context_max_lines.unwrap_or(120).clamp(40, 300),
         max_chars: req.context_max_chars.unwrap_or(4500).clamp(120, 12000),
@@ -437,6 +565,10 @@ fn deterministic_context_for_query(
             .and_then(log_index::QueryIntent::from_str),
         include_artifacts: req.context_include_artifacts.unwrap_or(true),
         explain: req.context_explain.unwrap_or(false),
+        retriever,
+        hybrid_lexical_weight: req.context_hybrid_lexical_weight.unwrap_or(0.45),
+        hybrid_bm25_weight: req.context_hybrid_bm25_weight.unwrap_or(0.35),
+        hybrid_embedding_weight: req.context_hybrid_embedding_weight.unwrap_or(0.20),
         ..log_index::BuildContextOptions::default()
     };
     match log_index::build_relevant_context_bundle_with_options(
@@ -445,7 +577,7 @@ fn deterministic_context_for_query(
         query,
         options,
     ) {
-        Ok(bundle) if !bundle.context_text.trim().is_empty() => Some(bundle.context_text),
+        Ok(bundle) if !bundle.context_text.trim().is_empty() => Some(bundle),
         _ => None,
     }
 }
@@ -455,18 +587,26 @@ fn build_llm_selected_context(
     req: &CompletionRequest,
     session_id: &str,
     query: &str,
-) -> Option<String> {
+) -> Option<LlmSelectedContext> {
     let chunk_tokens = req
         .context_selector_chunk_tokens
         .unwrap_or(128_000)
         .clamp(4_000, 128_000);
     let max_chunks = req.context_selector_max_chunks.unwrap_or(16).clamp(1, 64);
+    let total_tokens_cap = req
+        .context_selector_total_tokens_cap
+        .unwrap_or(256_000)
+        .clamp(4_000, 1_024_000);
+    let timeout_ms = req.context_selector_timeout_ms.unwrap_or(45_000).clamp(2_000, 180_000);
+    let early_stop = req.context_selector_early_stop.unwrap_or(true);
+    let max_chunks_from_budget = (total_tokens_cap / chunk_tokens).max(1);
+    let effective_max_chunks = max_chunks.min(max_chunks_from_budget);
     let corpus = match log_index::build_llm_selection_corpus(
         &state.log_index_path,
         session_id,
         log_index::BuildLlmSelectionCorpusOptions {
             chunk_chars: chunk_tokens.saturating_mul(4),
-            max_chunks,
+            max_chunks: effective_max_chunks,
             include_events: req.context_selector_include_events.unwrap_or(true),
         },
     ) {
@@ -489,8 +629,13 @@ fn build_llm_selected_context(
     let provider = req.provider.clone();
     let selector_model = req.context_selector_model.clone().or(req.model.clone());
     let mut chunk_notes = Vec::new();
+    let mut selector_signals = 0usize;
+    let selector_started = Instant::now();
 
     for (idx, chunk) in corpus.old_context_chunks.iter().enumerate() {
+        if selector_started.elapsed().as_millis() as u64 >= timeout_ms {
+            break;
+        }
         let selector_messages = vec![
             ChatMessage {
                 role: "system".to_string(),
@@ -512,12 +657,18 @@ fn build_llm_selected_context(
             selector_model.clone(),
             &selector_messages,
         ) {
-            Ok(text) => chunk_notes.push(format!(
-                "Chunk {}/{}:\n{}",
-                idx + 1,
-                corpus.old_context_chunks.len(),
-                truncate_text_chars(&text, 6000)
-            )),
+            Ok(text) => {
+                selector_signals += selector_signal_count(&text);
+                chunk_notes.push(format!(
+                    "Chunk {}/{}:\n{}",
+                    idx + 1,
+                    corpus.old_context_chunks.len(),
+                    truncate_text_chars(&text, 6000)
+                ));
+                if early_stop && chunk_notes.len() >= 2 && selector_signals >= 8 {
+                    break;
+                }
+            }
             Err(err) => {
                 eprintln!("llm-select chunk pass failed: {err}");
             }
@@ -552,12 +703,39 @@ fn build_llm_selected_context(
 
     let max_chars = req.context_max_chars.unwrap_or(9000).clamp(240, 24_000);
     let packed = format!(
-        "Session: {session_id}\nContext mode: llm-select\nQuery: {}\n\nRecent stdout/stderr/stdin (always included):\n{}\n\nLLM-selected relevant context:\n{}",
+        "Session: {session_id}\nContext mode: llm-select\nQuery: {}\nSelector chunks analyzed: {} / {} (budget capped to {})\n\nRecent stdout/stderr/stdin (always included):\n{}\n\nLLM-selected relevant context:\n{}",
         truncate_text_chars(query, 500),
+        chunk_notes.len(),
+        corpus.old_context_chunks.len(),
+        effective_max_chunks,
         recent,
         synthesis
     );
-    Some(truncate_text_chars(&packed, max_chars))
+    Some(LlmSelectedContext {
+        context_text: truncate_text_chars(&packed, max_chars),
+        selector_chunks: chunk_notes.len(),
+    })
+}
+
+fn selector_signal_count(text: &str) -> usize {
+    let mut score = 0usize;
+    for line in text.lines() {
+        let trimmed = line.trim().to_lowercase();
+        if trimmed.starts_with("- ") || trimmed.starts_with("* ") {
+            score += 1;
+        }
+        if trimmed.contains("error")
+            || trimmed.contains("fail")
+            || trimmed.contains("stderr")
+            || trimmed.contains("traceback")
+            || trimmed.contains("panic")
+            || trimmed.contains("command")
+            || trimmed.contains("file")
+        {
+            score += 1;
+        }
+    }
+    score
 }
 
 fn render_recent_context_block(corpus: &log_index::LlmSelectionCorpus) -> String {
@@ -631,6 +809,74 @@ fn is_diagnostic_query(text: &str) -> bool {
     ]
     .iter()
     .any(|needle| lowered.contains(needle))
+}
+
+fn configured_retriever_label(req: &CompletionRequest, mode: ContextMode) -> String {
+    if mode == ContextMode::LlmSelect {
+        return "llm-select".to_string();
+    }
+    req.context_retriever
+        .as_deref()
+        .and_then(log_index::RetrievalStrategy::from_str)
+        .unwrap_or(log_index::RetrievalStrategy::Lexical)
+        .as_str()
+        .to_string()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn log_completion_retrieval_ledger(
+    state: &AppState,
+    session_id: &str,
+    query: &str,
+    mode: ContextMode,
+    req: &CompletionRequest,
+    injected: Option<&InjectedContext>,
+    completion_value: Option<&Value>,
+    status: &str,
+    error: Option<String>,
+    model: &str,
+    provider: &str,
+) {
+    let answer_text = completion_value
+        .and_then(extract_completion_text)
+        .map(|text| truncate_text_chars(&text, 16_000));
+    let answer_chars = answer_text.as_ref().map(|v| v.chars().count()).unwrap_or(0);
+    let context_text = injected
+        .map(|value| truncate_text_chars(&value.context_text, 24_000));
+    let context_chars = context_text.as_ref().map(|v| v.chars().count()).unwrap_or(0);
+    let intent = injected
+        .and_then(|value| value.intent.clone())
+        .or_else(|| req.context_intent.clone());
+    let retriever = injected
+        .map(|value| value.retriever.clone())
+        .unwrap_or_else(|| configured_retriever_label(req, mode));
+    let selected_evidence_json = injected
+        .and_then(|value| value.selected_evidence_json.clone())
+        .map(|value| truncate_text_chars(&value, 24_000));
+
+    let entry = log_index::RetrievalLedgerEntry {
+        ts_ms: now_ms().min(i64::MAX as u128) as i64,
+        session_id: session_id.to_string(),
+        query: truncate_text_chars(query, 2_000),
+        context_mode: mode.as_str().to_string(),
+        retriever,
+        intent,
+        model: Some(model.to_string()),
+        provider: Some(provider.to_string()),
+        selector_used: injected.map(|value| value.selector_used).unwrap_or(false),
+        selector_chunks: injected.map(|value| value.selector_chunks).unwrap_or(0),
+        fallback_used: injected.map(|value| value.fallback_used).unwrap_or(false),
+        context_chars,
+        answer_chars,
+        status: status.to_string(),
+        error,
+        selected_evidence_json,
+        context_text,
+        answer_text,
+    };
+    if let Err(err) = log_index::append_retrieval_ledger(&state.log_index_path, &entry) {
+        eprintln!("retrieval ledger append failed: {err}");
+    }
 }
 
 async fn list_tools(State(state): State<AppState>) -> impl IntoResponse {
@@ -984,6 +1230,10 @@ struct ContextDebugQuery {
     q: Option<String>,
     query: Option<String>,
     intent: Option<String>,
+    retriever: Option<String>,
+    hybrid_lexical_weight: Option<f32>,
+    hybrid_bm25_weight: Option<f32>,
+    hybrid_embedding_weight: Option<f32>,
     max_lines: Option<usize>,
     max_chars: Option<usize>,
     output_window: Option<usize>,
@@ -1001,6 +1251,11 @@ async fn get_logs_context(
         .query
         .or(params.q)
         .unwrap_or_else(|| "what did I do wrong?".to_string());
+    let retriever = params
+        .retriever
+        .as_deref()
+        .and_then(log_index::RetrievalStrategy::from_str)
+        .unwrap_or(log_index::RetrievalStrategy::Lexical);
     let options = log_index::BuildContextOptions {
         max_lines: params.max_lines.unwrap_or(120).clamp(20, 400),
         max_chars: params.max_chars.unwrap_or(4500).clamp(120, 20000),
@@ -1012,6 +1267,10 @@ async fn get_logs_context(
             .and_then(log_index::QueryIntent::from_str),
         include_artifacts: params.include_artifacts.unwrap_or(true),
         explain: params.explain.unwrap_or(false),
+        retriever,
+        hybrid_lexical_weight: params.hybrid_lexical_weight.unwrap_or(0.45),
+        hybrid_bm25_weight: params.hybrid_bm25_weight.unwrap_or(0.35),
+        hybrid_embedding_weight: params.hybrid_embedding_weight.unwrap_or(0.20),
         ..log_index::BuildContextOptions::default()
     };
 
@@ -2213,8 +2472,15 @@ fn call_llm_with_messages(
         context_max_incidents: None,
         context_include_artifacts: None,
         context_explain: None,
+        context_retriever: None,
+        context_hybrid_lexical_weight: None,
+        context_hybrid_bm25_weight: None,
+        context_hybrid_embedding_weight: None,
         context_selector_chunk_tokens: None,
         context_selector_max_chunks: None,
+        context_selector_total_tokens_cap: None,
+        context_selector_timeout_ms: None,
+        context_selector_early_stop: None,
         context_selector_include_events: None,
         context_selector_model: None,
         model: Some(model.clone()),
@@ -3351,6 +3617,100 @@ mod tests {
             ContextMode::LlmSelect
         );
         assert_eq!(parse_context_mode(Some("selector")), ContextMode::LlmSelect);
+    }
+
+    #[test]
+    fn context_mode_as_str_values() {
+        assert_eq!(ContextMode::Off.as_str(), "off");
+        assert_eq!(ContextMode::Diagnostic.as_str(), "diagnostic");
+        assert_eq!(ContextMode::Always.as_str(), "always");
+        assert_eq!(ContextMode::LlmSelect.as_str(), "llm-select");
+    }
+
+    #[test]
+    fn configured_retriever_label_defaults_and_parses() {
+        let req = CompletionRequest {
+            prompt: Some("q".to_string()),
+            messages: None,
+            session_id: Some("sess_1".to_string()),
+            context_mode: Some("always".to_string()),
+            context_intent: None,
+            context_max_lines: None,
+            context_max_chars: None,
+            context_output_window: None,
+            context_max_incidents: None,
+            context_include_artifacts: None,
+            context_explain: None,
+            context_retriever: Some("bm25".to_string()),
+            context_hybrid_lexical_weight: None,
+            context_hybrid_bm25_weight: None,
+            context_hybrid_embedding_weight: None,
+            context_selector_chunk_tokens: None,
+            context_selector_max_chunks: None,
+            context_selector_total_tokens_cap: None,
+            context_selector_timeout_ms: None,
+            context_selector_early_stop: None,
+            context_selector_include_events: None,
+            context_selector_model: None,
+            model: None,
+            provider: None,
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            stop: None,
+        };
+        assert_eq!(configured_retriever_label(&req, ContextMode::Always), "bm25");
+        assert_eq!(
+            configured_retriever_label(&req, ContextMode::LlmSelect),
+            "llm-select"
+        );
+    }
+
+    #[test]
+    fn configured_retriever_label_falls_back_to_lexical() {
+        let req = CompletionRequest {
+            prompt: Some("q".to_string()),
+            messages: None,
+            session_id: Some("sess_1".to_string()),
+            context_mode: Some("always".to_string()),
+            context_intent: None,
+            context_max_lines: None,
+            context_max_chars: None,
+            context_output_window: None,
+            context_max_incidents: None,
+            context_include_artifacts: None,
+            context_explain: None,
+            context_retriever: Some("unknown".to_string()),
+            context_hybrid_lexical_weight: None,
+            context_hybrid_bm25_weight: None,
+            context_hybrid_embedding_weight: None,
+            context_selector_chunk_tokens: None,
+            context_selector_max_chunks: None,
+            context_selector_total_tokens_cap: None,
+            context_selector_timeout_ms: None,
+            context_selector_early_stop: None,
+            context_selector_include_events: None,
+            context_selector_model: None,
+            model: None,
+            provider: None,
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            stop: None,
+        };
+        assert_eq!(configured_retriever_label(&req, ContextMode::Always), "lexical");
+    }
+
+    #[test]
+    fn selector_signal_count_detects_debug_signals() {
+        let text = "- error[E0308] mismatched types\nLikely failing command: cargo test\n";
+        assert!(selector_signal_count(text) >= 3);
+    }
+
+    #[test]
+    fn selector_signal_count_zero_for_plain_text() {
+        let text = "hello world\njust narrative\n";
+        assert_eq!(selector_signal_count(text), 0);
     }
 
     #[test]
