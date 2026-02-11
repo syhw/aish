@@ -237,6 +237,67 @@ curl -fsS -X POST "$AISHD_URL/v1/tools/mcp.web_search/call" \
   | python3 -m json.tool
 ```
 
+## 12) `ai` shortcut usage and context/prompt composition
+
+Basic shortcut (`ai` == `ai llm`):
+
+```bash
+ai "Summarize this repo in 5 bullets."
+```
+
+Pipe prompt from stdin (also works with `ai` directly):
+
+```bash
+echo "Count to 5 slowly." | ai
+```
+
+Use a specific provider/model:
+
+```bash
+ai --provider local-3000 --model gemini-3-pro-preview "Count to 5 slowly"
+```
+
+How request body is built for `ai "why did this fail?"`:
+
+Without `AISH_SESSION_ID` in environment, `ai` sends:
+
+```json
+{
+  "prompt": "why did this fail?"
+}
+```
+
+With `AISH_SESSION_ID` set (for example inside `aish launch` shell), `ai` sends:
+
+```json
+{
+  "prompt": "why did this fail?",
+  "session_id": "<AISH_SESSION_ID>",
+  "context_mode": "diagnostic"
+}
+```
+
+How context is selected for that same query (before final model answer):
+
+```bash
+SID="$AISH_SESSION_ID"
+Q="why did this fail?"
+curl -fsS "$AISHD_URL/v1/logs/context/$SID?q=$(python3 - <<'PY' "$Q"
+import urllib.parse, sys
+print(urllib.parse.quote(sys.argv[1]))
+PY
+)&max_lines=120&max_chars=4500&output_window=1" | python3 -m json.tool
+```
+
+Equivalent explicit `/v1/completions` call (same shape as `ai` does):
+
+```bash
+curl -fsS "$AISHD_URL/v1/completions" \
+  -H 'content-type: application/json' \
+  -d "{\"prompt\":\"$Q\",\"session_id\":\"$SID\",\"context_mode\":\"diagnostic\"}" \
+  | python3 -m json.tool
+```
+
 ## Troubleshooting
 
 ### `JSONDecodeError` after `curl | python3 -c ...`
