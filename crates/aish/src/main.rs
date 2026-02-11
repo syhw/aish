@@ -57,6 +57,12 @@ enum CliCommand {
     },
     /// Show recent sessions and log locations
     Status,
+    /// Ensure aishd is running (useful for shell startup hooks)
+    EnsureDaemon {
+        /// Suppress informational output
+        #[arg(long, default_value_t = false)]
+        quiet: bool,
+    },
     /// Append a structured log event (used by shell hooks)
     Log {
         /// Event kind (e.g. command.start, command.end, terminal.resize)
@@ -143,6 +149,13 @@ fn main() -> Result<()> {
         }
         CliCommand::Status => {
             show_status(&cfg)?;
+        }
+        CliCommand::EnsureDaemon { quiet } => {
+            ensure_aishd_running(&cli.config, &cfg)?;
+            if !quiet {
+                let base_url = format!("http://{}:{}", cfg.server.hostname, cfg.server.port);
+                println!("aishd is running at {base_url}");
+            }
         }
         CliCommand::Log {
             kind,

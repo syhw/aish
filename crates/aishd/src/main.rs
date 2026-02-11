@@ -1,4 +1,4 @@
-use aish_core::config::{self, Config, OpenAICompatConfig};
+use aish_core::config::{self, Config, McpServerConfig, OpenAICompatConfig};
 use anyhow::{bail, Result};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, Sse};
@@ -955,6 +955,8 @@ async fn call_tool(
         "fs.read" => run_fs_read(req.args),
         "fs.write" => run_fs_write(req.args),
         "fs.list" => run_fs_list(req.args),
+        "mcp.list_tools" => run_mcp_list_tools(cfg, req.args),
+        "mcp.web_search" => run_mcp_web_search(cfg, req.args),
         _ => Err((StatusCode::NOT_FOUND, json!({"error": "unknown tool"}))),
     };
 
@@ -2967,6 +2969,7 @@ fn tool_system_prompt() -> String {
         "Formats:",
         "  {\"tool\":\"shell\",\"args\":{\"cmd\":\"ls\"}}",
         "  {\"tool_calls\":[{\"tool\":\"fs.read\",\"args\":{\"path\":\"README.md\"}}]}",
+        "  {\"tool\":\"mcp.web_search\",\"args\":{\"query\":\"latest rust mcp spec\"}}",
         "If no tool is needed, reply with a normal answer.",
     ]
     .join("\n")
@@ -3110,6 +3113,8 @@ fn execute_tool(
         "fs.read" => run_fs_read(args),
         "fs.write" => run_fs_write(args),
         "fs.list" => run_fs_list(args),
+        "mcp.list_tools" => run_mcp_list_tools(cfg, args),
+        "mcp.web_search" => run_mcp_web_search(cfg, args),
         _ => Err((StatusCode::NOT_FOUND, json!({"error": "unknown tool"}))),
     };
 
@@ -3288,6 +3293,29 @@ fn tool_defs() -> Vec<ToolDef> {
                 "required": ["path"]
             }),
         },
+        ToolDef {
+            name: "mcp.list_tools",
+            description: "List tools exposed by a configured MCP server",
+            args_schema: json!({
+                "type": "object",
+                "properties": {
+                    "server": { "type": "string", "description": "MCP server name (default: web-search-prime or only configured server)" }
+                }
+            }),
+        },
+        ToolDef {
+            name: "mcp.web_search",
+            description: "Run web search via MCP server tool call",
+            args_schema: json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string" },
+                    "server": { "type": "string", "description": "MCP server name (default: web-search-prime)" },
+                    "max_results": { "type": "integer" }
+                },
+                "required": ["query"]
+            }),
+        },
     ]
 }
 
@@ -3315,6 +3343,24 @@ struct FsWriteArgs {
 #[derive(Deserialize)]
 struct FsListArgs {
     path: String,
+}
+
+#[derive(Deserialize)]
+struct McpListToolsArgs {
+    server: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct McpWebSearchArgs {
+    query: String,
+    server: Option<String>,
+    max_results: Option<u32>,
+}
+
+#[derive(Debug, Clone)]
+struct McpSession {
+    session_id: Option<String>,
+    protocol_version: String,
 }
 
 fn run_shell(args: Value) -> Result<Value, (StatusCode, Value)> {
@@ -3346,6 +3392,451 @@ fn run_shell(args: Value) -> Result<Value, (StatusCode, Value)> {
         "stdout": String::from_utf8_lossy(&output.stdout),
         "stderr": String::from_utf8_lossy(&output.stderr),
     }))
+}
+
+fn run_mcp_list_tools(cfg: &Config, args: Value) -> Result<Value, (StatusCode, Value)> {
+    let args: McpListToolsArgs = serde_json::from_value(args)
+        .map_err(|e| (StatusCode::BAD_REQUEST, json!({"error": e.to_string()})))?;
+    match mcp_list_tools(cfg, args.server.as_deref()) {
+        Ok((server, tools)) => Ok(json!({
+            "server": server,
+            "tools": tools,
+        })),
+        Err(err) => Err((mcp_error_status(&err), json!({"error": err}))),
+    }
+}
+
+fn run_mcp_web_search(cfg: &Config, args: Value) -> Result<Value, (StatusCode, Value)> {
+    let args: McpWebSearchArgs = serde_json::from_value(args)
+        .map_err(|e| (StatusCode::BAD_REQUEST, json!({"error": e.to_string()})))?;
+    if args.query.trim().is_empty() {
+        return Err((StatusCode::BAD_REQUEST, json!({"error": "query is required"})));
+    }
+    match mcp_web_search(cfg, args.server.as_deref(), &args.query, args.max_results) {
+        Ok(value) => Ok(value),
+        Err(err) => Err((mcp_error_status(&err), json!({"error": err}))),
+    }
+}
+
+fn mcp_error_status(message: &str) -> StatusCode {
+    let lowered = message.to_lowercase();
+    if lowered.contains("not configured")
+        || lowered.contains("missing")
+        || lowered.contains("unsupported")
+        || lowered.contains("invalid")
+    {
+        StatusCode::BAD_REQUEST
+    } else {
+        StatusCode::BAD_GATEWAY
+    }
+}
+
+fn mcp_list_tools(cfg: &Config, requested_server: Option<&str>) -> Result<(String, Vec<Value>), String> {
+    let (server_name, server) = resolve_mcp_server(cfg, requested_server)?;
+    let session = mcp_initialize(server)?;
+    let response = mcp_jsonrpc_request(
+        server,
+        &session,
+        2,
+        "tools/list",
+        Some(json!({})),
+    )?;
+    let tools = response
+        .get("result")
+        .and_then(|v| v.get("tools"))
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    Ok((server_name.to_string(), tools))
+}
+
+fn mcp_web_search(
+    cfg: &Config,
+    requested_server: Option<&str>,
+    query: &str,
+    max_results: Option<u32>,
+) -> Result<Value, String> {
+    let (server_name, server) = resolve_mcp_server(cfg, requested_server)?;
+    let session = mcp_initialize(server)?;
+    let list_response = mcp_jsonrpc_request(
+        server,
+        &session,
+        2,
+        "tools/list",
+        Some(json!({})),
+    )?;
+    let tools = list_response
+        .get("result")
+        .and_then(|v| v.get("tools"))
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let tool = pick_mcp_web_search_tool(&tools)
+        .ok_or_else(|| "no suitable MCP web-search tool found".to_string())?;
+    let tool_name = tool
+        .get("name")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "selected MCP tool has no name".to_string())?;
+    let arguments = build_web_search_arguments(&tool, query, max_results);
+    let call_response = mcp_jsonrpc_request(
+        server,
+        &session,
+        3,
+        "tools/call",
+        Some(json!({
+            "name": tool_name,
+            "arguments": arguments,
+        })),
+    )?;
+    let content_text = extract_mcp_content_text(&call_response);
+    Ok(json!({
+        "server": server_name,
+        "tool": tool_name,
+        "query": query,
+        "content_text": content_text,
+        "raw": call_response,
+    }))
+}
+
+fn resolve_mcp_server<'a>(
+    cfg: &'a Config,
+    requested_server: Option<&'a str>,
+) -> Result<(&'a str, &'a McpServerConfig), String> {
+    if cfg.mcp_servers.is_empty() {
+        return Err("MCP servers not configured (add `mcpServers` in config)".to_string());
+    }
+    if let Some(name) = requested_server {
+        let server = cfg
+            .mcp_servers
+            .get(name)
+            .ok_or_else(|| format!("MCP server `{name}` not configured"))?;
+        if !server.transport_type.eq_ignore_ascii_case("streamable-http") {
+            return Err(format!(
+                "unsupported MCP transport `{}` for server `{name}`",
+                server.transport_type
+            ));
+        }
+        if server.url.trim().is_empty() {
+            return Err(format!("MCP server `{name}` has empty url"));
+        }
+        return Ok((name, server));
+    }
+    if let Some(server) = cfg.mcp_servers.get("web-search-prime") {
+        if server.transport_type.eq_ignore_ascii_case("streamable-http") && !server.url.trim().is_empty()
+        {
+            return Ok(("web-search-prime", server));
+        }
+    }
+    if cfg.mcp_servers.len() == 1 {
+        if let Some((name, server)) = cfg.mcp_servers.iter().next() {
+            if !server.transport_type.eq_ignore_ascii_case("streamable-http") {
+                return Err(format!(
+                    "unsupported MCP transport `{}` for server `{name}`",
+                    server.transport_type
+                ));
+            }
+            if server.url.trim().is_empty() {
+                return Err(format!("MCP server `{name}` has empty url"));
+            }
+            return Ok((name.as_str(), server));
+        }
+    }
+    Err("multiple MCP servers configured; specify `server` explicitly".to_string())
+}
+
+fn mcp_initialize(server: &McpServerConfig) -> Result<McpSession, String> {
+    let init_request = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-03-26",
+            "capabilities": {},
+            "clientInfo": {
+                "name": "aishd",
+                "version": env!("CARGO_PKG_VERSION"),
+            }
+        }
+    });
+    let (init_response, session_header) = mcp_post(server, None, None, &init_request)?;
+    if let Some(err) = mcp_error_from_payload(&init_response) {
+        return Err(format!("MCP initialize failed: {err}"));
+    }
+    if init_response.get("result").is_none() {
+        return Err(format!(
+            "MCP initialize missing result payload: {}",
+            truncate_text_chars(&init_response.to_string(), 1_200)
+        ));
+    }
+    let protocol_version = init_response
+        .get("result")
+        .and_then(|v| v.get("protocolVersion"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("2025-03-26")
+        .to_string();
+    let session = McpSession {
+        session_id: session_header,
+        protocol_version,
+    };
+    let initialized_notification = json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/initialized",
+        "params": {}
+    });
+    let _ = mcp_post(
+        server,
+        session.session_id.as_deref(),
+        Some(&session.protocol_version),
+        &initialized_notification,
+    );
+    Ok(session)
+}
+
+fn mcp_jsonrpc_request(
+    server: &McpServerConfig,
+    session: &McpSession,
+    id: i64,
+    method: &str,
+    params: Option<Value>,
+) -> Result<Value, String> {
+    let mut body = json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": method,
+    });
+    if let Some(params) = params {
+        body["params"] = params;
+    }
+    let (response, _) = mcp_post(
+        server,
+        session.session_id.as_deref(),
+        Some(&session.protocol_version),
+        &body,
+    )?;
+    if let Some(err) = mcp_error_from_payload(&response) {
+        return Err(format!("MCP method `{method}` failed: {err}"));
+    }
+    Ok(response)
+}
+
+fn mcp_post(
+    server: &McpServerConfig,
+    session_id: Option<&str>,
+    protocol_version: Option<&str>,
+    body: &Value,
+) -> Result<(Value, Option<String>), String> {
+    let timeout_ms = server.timeout_ms.unwrap_or(30_000).clamp(1_000, 120_000);
+    let agent = ureq::AgentBuilder::new()
+        .timeout(Duration::from_millis(timeout_ms))
+        .build();
+    let mut req = agent
+        .post(server.url.trim())
+        .set("Content-Type", "application/json")
+        .set("Accept", "application/json, application/json-seq, text/event-stream");
+    if let Some(session_id) = session_id {
+        req = req.set("Mcp-Session-Id", session_id);
+    }
+    if let Some(protocol_version) = protocol_version {
+        req = req.set("Mcp-Protocol-Version", protocol_version);
+    }
+    for (key, value) in &server.headers {
+        let expanded = expand_mcp_header_value(value)?;
+        req = req.set(key, &expanded);
+    }
+    let response = req.send_string(&body.to_string());
+    match response {
+        Ok(resp) => {
+            let session_header = resp
+                .header("Mcp-Session-Id")
+                .or_else(|| resp.header("mcp-session-id"))
+                .map(|v| v.to_string());
+            let text = resp.into_string().unwrap_or_default();
+            let parsed = parse_mcp_response_body(&text);
+            Ok((parsed, session_header))
+        }
+        Err(ureq::Error::Status(status, resp)) => {
+            let text = resp.into_string().unwrap_or_default();
+            let parsed = parse_mcp_response_body(&text);
+            Err(format!("MCP HTTP {status}: {}", parsed))
+        }
+        Err(err) => Err(format!("MCP request error: {err}")),
+    }
+}
+
+fn parse_mcp_response_body(text: &str) -> Value {
+    if let Ok(parsed) = serde_json::from_str::<Value>(text) {
+        return parsed;
+    }
+    // Streamable HTTP servers can return SSE frames where each data line is JSON-RPC.
+    let mut last_json: Option<Value> = None;
+    let mut buf = String::new();
+    for raw_line in text.lines() {
+        let line = raw_line.trim_end();
+        if let Some(data) = line.strip_prefix("data:") {
+            let payload = data.trim();
+            if payload == "[DONE]" || payload.is_empty() {
+                continue;
+            }
+            if let Ok(parsed) = serde_json::from_str::<Value>(payload) {
+                last_json = Some(parsed);
+            } else {
+                buf.push_str(payload);
+            }
+            continue;
+        }
+        if line.is_empty() {
+            if !buf.is_empty() {
+                if let Ok(parsed) = serde_json::from_str::<Value>(&buf) {
+                    last_json = Some(parsed);
+                }
+                buf.clear();
+            }
+            continue;
+        }
+        if !line.starts_with("event:") && !line.starts_with(':') {
+            buf.push_str(line);
+        }
+    }
+    if !buf.is_empty() {
+        if let Ok(parsed) = serde_json::from_str::<Value>(&buf) {
+            last_json = Some(parsed);
+        }
+    }
+    last_json.unwrap_or_else(|| json!({ "raw": text }))
+}
+
+fn mcp_error_from_payload(payload: &Value) -> Option<String> {
+    if let Some(err) = payload.get("error") {
+        return Some(err.to_string());
+    }
+    if payload
+        .get("success")
+        .and_then(|v| v.as_bool())
+        .map(|ok| !ok)
+        .unwrap_or(false)
+    {
+        let code = payload
+            .get("code")
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        let msg = payload
+            .get("msg")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown MCP error");
+        return Some(format!("code={code} msg={msg}"));
+    }
+    None
+}
+
+fn expand_mcp_header_value(raw: &str) -> Result<String, String> {
+    let mut value = raw.to_string();
+    let zai_api_key = env::var("ZAI_API_KEY").ok().filter(|v| !v.trim().is_empty());
+    if value.contains("${ZAI_API_KEY}") || value.contains("$ZAI_API_KEY") || value.contains("your_api_key") {
+        let token = zai_api_key.ok_or_else(|| {
+            "MCP header references ZAI API key but ZAI_API_KEY is not set".to_string()
+        })?;
+        value = value.replace("${ZAI_API_KEY}", &token);
+        value = value.replace("$ZAI_API_KEY", &token);
+        value = value.replace("your_api_key", &token);
+    }
+    Ok(value)
+}
+
+fn pick_mcp_web_search_tool(tools: &[Value]) -> Option<Value> {
+    let mut best: Option<(i32, Value)> = None;
+    for tool in tools {
+        let name = tool
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_lowercase();
+        let score = if name.contains("web_search_prime") {
+            50
+        } else if name.contains("web") && name.contains("search") {
+            40
+        } else if name.contains("search") {
+            30
+        } else if name.contains("browse") {
+            20
+        } else {
+            0
+        };
+        if score > 0 {
+            if best.as_ref().map(|(s, _)| score > *s).unwrap_or(true) {
+                best = Some((score, tool.clone()));
+            }
+        }
+    }
+    if let Some((_, tool)) = best {
+        return Some(tool);
+    }
+    if tools.len() == 1 {
+        return Some(tools[0].clone());
+    }
+    None
+}
+
+fn build_web_search_arguments(tool: &Value, query: &str, max_results: Option<u32>) -> Value {
+    let schema = tool
+        .get("inputSchema")
+        .or_else(|| tool.get("input_schema"))
+        .unwrap_or(&Value::Null);
+    let properties = schema
+        .get("properties")
+        .and_then(|v| v.as_object())
+        .cloned()
+        .unwrap_or_default();
+    let mut args = serde_json::Map::new();
+    let query_key = [
+        "query",
+        "q",
+        "search_query",
+        "searchQuery",
+        "keywords",
+        "keyword",
+        "input",
+        "text",
+    ]
+    .iter()
+    .find(|key| properties.contains_key(**key))
+    .copied()
+    .unwrap_or("query");
+    args.insert(query_key.to_string(), json!(query));
+    if let Some(max_results) = max_results {
+        if let Some(max_key) = ["max_results", "num_results", "count", "limit", "top_k"]
+            .iter()
+            .find(|key| properties.contains_key(**key))
+        {
+            args.insert((*max_key).to_string(), json!(max_results));
+        }
+    }
+    Value::Object(args)
+}
+
+fn extract_mcp_content_text(response: &Value) -> String {
+    let mut out = Vec::new();
+    if let Some(items) = response
+        .get("result")
+        .and_then(|v| v.get("content"))
+        .and_then(|v| v.as_array())
+    {
+        for item in items {
+            if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
+                out.push(text.to_string());
+            } else if let Some(text) = item.get("content").and_then(|v| v.as_str()) {
+                out.push(text.to_string());
+            }
+        }
+    }
+    if out.is_empty() {
+        response
+            .get("result")
+            .and_then(|v| v.get("structuredContent"))
+            .map(|v| v.to_string())
+            .unwrap_or_default()
+    } else {
+        out.join("\n")
+    }
 }
 
 fn select_shell() -> (String, Vec<String>) {
@@ -3711,6 +4202,76 @@ mod tests {
     fn selector_signal_count_zero_for_plain_text() {
         let text = "hello world\njust narrative\n";
         assert_eq!(selector_signal_count(text), 0);
+    }
+
+    #[test]
+    fn expand_mcp_header_value_substitutes_zai_key() {
+        let _guard = env_lock().lock().unwrap();
+        env::set_var("ZAI_API_KEY", "abc123");
+        let got = expand_mcp_header_value("Bearer your_api_key").unwrap();
+        assert_eq!(got, "Bearer abc123");
+        let got_env = expand_mcp_header_value("Bearer ${ZAI_API_KEY}").unwrap();
+        assert_eq!(got_env, "Bearer abc123");
+        env::remove_var("ZAI_API_KEY");
+    }
+
+    #[test]
+    fn pick_mcp_web_search_tool_prefers_search_name() {
+        let tools = vec![
+            json!({"name":"other_tool"}),
+            json!({"name":"web_search_prime"}),
+            json!({"name":"search"}),
+        ];
+        let picked = pick_mcp_web_search_tool(&tools).expect("expected a picked tool");
+        assert_eq!(picked["name"], "web_search_prime");
+    }
+
+    #[test]
+    fn build_web_search_arguments_prefers_schema_keys() {
+        let tool = json!({
+            "name": "web_search_prime",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "q": {"type":"string"},
+                    "count": {"type":"integer"}
+                }
+            }
+        });
+        let args = build_web_search_arguments(&tool, "rust mcp", Some(5));
+        assert_eq!(args["q"], "rust mcp");
+        assert_eq!(args["count"], 5);
+    }
+
+    #[test]
+    fn resolve_mcp_server_uses_web_search_prime_default() {
+        let mut cfg = Config::default();
+        cfg.mcp_servers.insert(
+            "web-search-prime".to_string(),
+            McpServerConfig {
+                transport_type: "streamable-http".to_string(),
+                url: "https://example.invalid/mcp".to_string(),
+                headers: BTreeMap::new(),
+                timeout_ms: None,
+            },
+        );
+        let (name, _server) = resolve_mcp_server(&cfg, None).expect("expected default server");
+        assert_eq!(name, "web-search-prime");
+    }
+
+    #[test]
+    fn parse_mcp_response_body_reads_sse_data_frame() {
+        let sse = "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"web_search_prime\"}]}}\n\n";
+        let parsed = parse_mcp_response_body(sse);
+        assert_eq!(parsed["id"], 2);
+        assert_eq!(parsed["result"]["tools"][0]["name"], "web_search_prime");
+    }
+
+    #[test]
+    fn mcp_error_from_payload_detects_non_jsonrpc_error_shape() {
+        let payload = json!({"code": 1000, "msg": "Authentication Failed", "success": false});
+        let err = mcp_error_from_payload(&payload).expect("expected error");
+        assert!(err.contains("Authentication Failed"));
     }
 
     #[test]

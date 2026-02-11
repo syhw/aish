@@ -217,6 +217,26 @@ Restart/resume workflow test:
 scripts/test_resume_workflow.sh
 ```
 
+MCP web search smoke test (live):
+
+```bash
+ZAI_API_KEY=... scripts/test_mcp_web_search.sh
+```
+
+Direct MCP tool calls:
+
+```bash
+curl -fsS -X POST "$AISHD_URL/v1/tools/mcp.list_tools/call" \
+  -H 'content-type: application/json' \
+  -d '{"args":{"server":"web-search-prime"},"approved":true}' \
+  | python3 -m json.tool
+
+curl -fsS -X POST "$AISHD_URL/v1/tools/mcp.web_search/call" \
+  -H 'content-type: application/json' \
+  -d '{"args":{"server":"web-search-prime","query":"latest MCP protocol streamable-http summary","max_results":5},"approved":true}' \
+  | python3 -m json.tool
+```
+
 ## Troubleshooting
 
 ### `JSONDecodeError` after `curl | python3 -c ...`

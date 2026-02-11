@@ -40,6 +40,7 @@ aish is a CLI + daemon that augments zsh-in-tmux workflows with logging and agen
 - **Daemon + CLI**: `aishd` (server) and `aish` (launcher/CLI).
 - **LLM providers**: OpenAI-compatible APIs with profiles + model aliases (Z.ai, Together).
 - **Tool runtime**: `shell`, `fs.read`, `fs.write`, `fs.list` with per-tool approval policy.
+- **MCP tools**: `mcp.list_tools` and `mcp.web_search` via streamable-HTTP MCP servers.
 - **Logging**: JSONL event logs, stdin command capture, PTY output capture.
 - **Log index**: SQLite index (`logs.sqlite`) for queryable context across events/input/output/file edits.
 - **Sessions + agents**: in-memory registry with JSONL persistence.
@@ -52,6 +53,14 @@ aish is a CLI + daemon that augments zsh-in-tmux workflows with logging and agen
 - **Context editing**: clear tool uses (keep last 3) + optional compaction.
 
 ## Quickstart
+Install (one command):
+```bash
+./scripts/install.sh
+```
+This builds release binaries, installs `aish`/`aishd`/`ai` symlinks in a user bin
+directory, updates `~/.zshrc` and `~/.bashrc` PATH blocks, and adds daemon
+autostart to your active shell rc (`zsh` or `bash`).
+
 Build:
 ```bash
 cargo build
@@ -119,6 +128,7 @@ Primary commands:
 - `aish serve`: starts aishd only.
 - `aish llm ...`: calls `/v1/completions` via aishd (reads stdin if no prompt).
 - `aish status`: shows recent sessions and log locations.
+- `aish ensure-daemon [--quiet]`: checks health and starts `aishd` when needed.
 
 Shell hooks:
 - `aish launch` writes hooks to `~/.config/aish/aish.zsh` and uses `ZDOTDIR=~/.config/aish/zdot`.
@@ -164,6 +174,23 @@ Environment variables:
 - `TOGETHER_API_KEY` (Together profile)
 - `AISH_OPENAI_COMPAT_BASE_URL`, `AISH_OPENAI_COMPAT_MODEL`, `AISH_OPENAI_COMPAT_COMPLETIONS_PATH`
 - `AISH_OPENAI_COMPAT_API_KEY` (overrides `ZAI_API_KEY` when set; empty string falls back to `ZAI_API_KEY`)
+
+MCP servers:
+```json
+{
+  "mcpServers": {
+    "web-search-prime": {
+      "type": "streamable-http",
+      "url": "https://api.z.ai/api/mcp/web_search_prime/mcp",
+      "headers": {
+        "Authorization": "Bearer your_api_key"
+      }
+    }
+  }
+}
+```
+If a header contains `your_api_key`, `${ZAI_API_KEY}`, or `$ZAI_API_KEY`,
+`aishd` substitutes it from the `ZAI_API_KEY` environment variable.
 
 Tool policies:
 ```json

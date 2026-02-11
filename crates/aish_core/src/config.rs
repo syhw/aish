@@ -14,6 +14,8 @@ pub struct Config {
     pub share: String,
     pub providers: ProvidersConfig,
     pub tools: ToolsConfig,
+    #[serde(rename = "mcpServers", alias = "mcp_servers")]
+    pub mcp_servers: BTreeMap<String, McpServerConfig>,
 }
 
 impl Default for Config {
@@ -25,6 +27,7 @@ impl Default for Config {
             share: "manual".to_string(),
             providers: ProvidersConfig::default(),
             tools: ToolsConfig::default(),
+            mcp_servers: BTreeMap::new(),
         }
     }
 }
@@ -145,6 +148,27 @@ impl Default for ModelAlias {
         Self {
             provider: String::new(),
             model: String::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct McpServerConfig {
+    #[serde(rename = "type")]
+    pub transport_type: String,
+    pub url: String,
+    pub headers: BTreeMap<String, String>,
+    pub timeout_ms: Option<u64>,
+}
+
+impl Default for McpServerConfig {
+    fn default() -> Self {
+        Self {
+            transport_type: "streamable-http".to_string(),
+            url: String::new(),
+            headers: BTreeMap::new(),
+            timeout_ms: None,
         }
     }
 }
@@ -298,5 +322,57 @@ mod tests {
 
         std::env::remove_var("ZAI_API_KEY");
         std::env::remove_var("AISH_OPENAI_COMPAT_API_KEY");
+    }
+
+    #[test]
+    fn parses_mcp_servers_from_mcp_servers_key() {
+        let _guard = env_lock().lock().unwrap();
+        let path = temp_config_path("mcp_servers");
+        fs::write(
+            &path,
+            r#"{
+  "mcp_servers": {
+    "web-search-prime": {
+      "type": "streamable-http",
+      "url": "https://example.invalid/mcp",
+      "headers": { "Authorization": "Bearer your_api_key" }
+    }
+  }
+}"#,
+        )
+        .unwrap();
+        let cfg = load(&path).unwrap();
+        fs::remove_file(&path).ok();
+        let server = cfg
+            .mcp_servers
+            .get("web-search-prime")
+            .expect("missing mcp server");
+        assert_eq!(server.transport_type, "streamable-http");
+        assert_eq!(server.url, "https://example.invalid/mcp");
+        assert_eq!(
+            server.headers.get("Authorization").cloned().unwrap_or_default(),
+            "Bearer your_api_key"
+        );
+    }
+
+    #[test]
+    fn parses_mcp_servers_from_mcp_servers_camel_case_key() {
+        let _guard = env_lock().lock().unwrap();
+        let path = temp_config_path("mcpServers");
+        fs::write(
+            &path,
+            r#"{
+  "mcpServers": {
+    "web-search-prime": {
+      "type": "streamable-http",
+      "url": "https://example.invalid/mcp"
+    }
+  }
+}"#,
+        )
+        .unwrap();
+        let cfg = load(&path).unwrap();
+        fs::remove_file(&path).ok();
+        assert!(cfg.mcp_servers.contains_key("web-search-prime"));
     }
 }
