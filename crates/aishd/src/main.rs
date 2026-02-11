@@ -2353,11 +2353,11 @@ fn call_openai_compat_completions(
     let agent = ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(60))
         .build();
-    let response = agent
-        .post(&url)
-        .set("Authorization", &format!("Bearer {}", api_key))
-        .set("Content-Type", "application/json")
-        .send_string(&body.to_string());
+    let mut http = agent.post(&url).set("Content-Type", "application/json");
+    if !api_key.trim().is_empty() {
+        http = http.set("Authorization", &format!("Bearer {}", api_key));
+    }
+    let response = http.send_string(&body.to_string());
 
     match response {
         Ok(resp) => {
@@ -2434,6 +2434,15 @@ fn resolve_api_key(
                 return Ok(value);
             }
         }
+    }
+
+    let base_url = provider.base_url.to_lowercase();
+    if base_url.starts_with("http://localhost")
+        || base_url.starts_with("http://127.0.0.1")
+        || base_url.starts_with("http://[::1]")
+    {
+        // Local OpenAI-compatible servers often run without auth.
+        return Ok(String::new());
     }
 
     Err((

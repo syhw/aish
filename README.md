@@ -2,6 +2,68 @@
 
 aish is a CLI + daemon that augments zsh-in-tmux workflows with logging and agentic LLM execution.
 
+## Quickstart
+Install (one command):
+```bash
+./scripts/install.sh
+```
+This installs `aish`, `aishd`, and `ai`, updates PATH in your shell rc, and adds
+daemon autostart for interactive shells.
+
+Plug in an LLM right away:
+```bash
+export ZAI_API_KEY="your-key"
+mkdir -p ~/.config/aish
+cat > ~/.config/aish/aish.json <<'JSON'
+{
+  "server": { "hostname": "127.0.0.1", "port": 5033 },
+  "providers": {
+    "openai_compat": {
+      "base_url": "https://api.z.ai/api/coding/paas/v4",
+      "model": "glm-4.7",
+      "completions_path": "/chat/completions",
+      "api_key_env": "ZAI_API_KEY"
+    },
+    "openai_compat_profiles": {
+      "together": {
+        "base_url": "https://api.together.ai/v1",
+        "model": "moonshotai/Kimi-K2.5",
+        "completions_path": "/chat/completions",
+        "api_key_env": "TOGETHER_API_KEY"
+      },
+      "local-3000": {
+        "base_url": "http://localhost:3000",
+        "model": "gemini-3-pro-preview",
+        "completions_path": "/v1/chat/completions"
+      }
+    },
+    "model_aliases": {
+      "kimi-k2.5": { "provider": "together", "model": "moonshotai/Kimi-K2.5" }
+    }
+  },
+  "tools": { "default_policy": "ask" },
+  "mcpServers": {
+    "web-search-prime": {
+      "type": "streamable-http",
+      "url": "https://api.z.ai/api/mcp/web_search_prime/mcp",
+      "headers": {
+        "Authorization": "Bearer ${ZAI_API_KEY}"
+      }
+    }
+  }
+}
+JSON
+```
+
+Run and verify:
+```bash
+ai ensure-daemon
+curl -fsS http://127.0.0.1:5033/health
+ai "Say hello in one sentence."
+ai llm "Say hello in one sentence."
+ai llm --provider local-3000 --model gemini-3-pro-preview "Count to 5 slowly"
+```
+
 ## Architecture
 ```text
                          +----------------------+
@@ -52,76 +114,6 @@ aish is a CLI + daemon that augments zsh-in-tmux workflows with logging and agen
 - **Runs registry**: list/get/cancel runs.
 - **Context editing**: clear tool uses (keep last 3) + optional compaction.
 
-## Quickstart
-Install (one command):
-```bash
-./scripts/install.sh
-```
-This builds release binaries, installs `aish`/`aishd`/`ai` symlinks in a user bin
-directory, updates `~/.zshrc` and `~/.bashrc` PATH blocks, and adds daemon
-autostart to your active shell rc (`zsh` or `bash`).
-
-Build:
-```bash
-cargo build
-```
-
-Run server (default config):
-```bash
-./target/debug/aishd
-```
-
-Or use the CLI:
-```bash
-./target/debug/aish serve
-```
-
-Health check:
-```bash
-curl -s http://127.0.0.1:5033/health
-```
-Adjust the port to match your config (defaults to `4096` if no config file exists).
-
-CLI status and LLM:
-```bash
-./target/debug/aish status
-./target/debug/aish llm "Say hello in one sentence."
-```
-
-When `AISH_SESSION_ID` is set (inside `aish launch` shell), `aish llm` sends
-`session_id` with `context_mode: "diagnostic"` so prompts like "what did I do
-wrong?" can use indexed session context from `logs.sqlite`.
-Inspect selected context directly (no LLM call) with:
-`GET /v1/logs/context/:session_id?q=what+did+i+do+wrong&max_lines=120`.
-The response includes `selected_evidence` items with categories, scores, and reasons.
-You can tune context packing with `max_chars` and local output expansion with
-`output_window` (0-5).
-
-Create a session and agent:
-```bash
-SESSION_ID=$(curl -s http://127.0.0.1:5033/v1/sessions \
-  -H 'Content-Type: application/json' \
-  -d '{"title":"demo"}' | python -c 'import sys,json; print(json.load(sys.stdin)["id"])')
-
-AGENT_ID=$(curl -s http://127.0.0.1:5033/v1/sessions/$SESSION_ID/agents \
-  -H 'Content-Type: application/json' \
-  -d '{}' | python -c 'import sys,json; print(json.load(sys.stdin)["id"])')
-```
-
-Run an agent:
-```bash
-curl -s http://127.0.0.1:5033/v1/agents/$AGENT_ID/run \
-  -H 'Content-Type: application/json' \
-  -d '{"prompt":"Say hello","approved":true,"tools":["shell"]}'
-```
-
-Stream an agent run (SSE):
-```bash
-curl -N http://127.0.0.1:5033/v1/agents/$AGENT_ID/run/stream \
-  -H 'Content-Type: application/json' \
-  -d '{"prompt":"Say hello","approved":true,"tools":["shell"]}'
-```
-
 ## CLI
 Primary commands:
 - `aish launch`: starts aishd if needed and launches a tmux-backed shell.
@@ -129,6 +121,7 @@ Primary commands:
 - `aish llm ...`: calls `/v1/completions` via aishd (reads stdin if no prompt).
 - `aish status`: shows recent sessions and log locations.
 - `aish ensure-daemon [--quiet]`: checks health and starts `aishd` when needed.
+- `ai "prompt"`: shortcut for `ai llm "prompt"` (and `echo "prompt" | ai` works too).
 
 Shell hooks:
 - `aish launch` writes hooks to `~/.config/aish/aish.zsh` and uses `ZDOTDIR=~/.config/aish/zdot`.
@@ -156,6 +149,11 @@ Example (Z.ai + Together):
         "model": "moonshotai/Kimi-K2.5",
         "completions_path": "/chat/completions",
         "api_key_env": "TOGETHER_API_KEY"
+      },
+      "local-3000": {
+        "base_url": "http://localhost:3000",
+        "model": "gemini-3-pro-preview",
+        "completions_path": "/v1/chat/completions"
       }
     },
     "model_aliases": {
@@ -168,6 +166,10 @@ Example (Z.ai + Together):
   }
 }
 ```
+Local profile (`local-3000`) matches endpoints that accept:
+`POST http://localhost:3000/v1/chat/completions` with `model`, `messages`, and optional `stream`.
+For localhost providers, `aishd` will skip `Authorization` if no API key is configured.
+
 
 Environment variables:
 - `ZAI_API_KEY` (default OpenAI-compat provider)
@@ -183,14 +185,16 @@ MCP servers:
       "type": "streamable-http",
       "url": "https://api.z.ai/api/mcp/web_search_prime/mcp",
       "headers": {
-        "Authorization": "Bearer your_api_key"
+        "Authorization": "Bearer ${ZAI_API_KEY}"
       }
     }
   }
 }
 ```
-If a header contains `your_api_key`, `${ZAI_API_KEY}`, or `$ZAI_API_KEY`,
-`aishd` substitutes it from the `ZAI_API_KEY` environment variable.
+In the MCP example above, `${ZAI_API_KEY}` means `aishd` will inject the value from your
+environment variable `ZAI_API_KEY` at runtime.
+If your MCP server needs a different token, set it directly in the header, for example:
+`"Authorization": "Bearer mcp-specific-token"`.
 
 Tool policies:
 ```json

@@ -4,6 +4,7 @@ use clap::{Parser, Subcommand};
 use serde_json::{json, Map, Value};
 use std::env;
 use std::fs;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread::sleep;
@@ -100,10 +101,30 @@ enum CliCommand {
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
-    let cli = Cli::parse();
+    let argv = normalize_cli_args(env::args().collect());
+    let cli = Cli::parse_from(argv);
     let cfg = config::load(&cli.config)?;
 
-    match cli.command.unwrap_or(CliCommand::Launch) {
+    let command = match cli.command {
+        Some(cmd) => cmd,
+        None => {
+            if !std::io::stdin().is_terminal() {
+                CliCommand::Llm {
+                    prompt: Vec::new(),
+                    provider: None,
+                    model: None,
+                    max_tokens: None,
+                    temperature: None,
+                    top_p: None,
+                    stop: Vec::new(),
+                }
+            } else {
+                CliCommand::Launch
+            }
+        }
+    };
+
+    match command {
         CliCommand::Launch => {
             ensure_aishd_running(&cli.config, &cfg)?;
             if !inside_tmux() {
@@ -188,6 +209,56 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn normalize_cli_args(raw: Vec<String>) -> Vec<String> {
+    if raw.len() <= 1 {
+        return raw;
+    }
+
+    let known_subcommands = [
+        "launch",
+        "serve",
+        "web",
+        "attach",
+        "llm",
+        "status",
+        "log",
+        "ensure-daemon",
+        "ensure_daemon",
+        "help",
+    ];
+
+    let mut idx = 1usize;
+    while idx < raw.len() {
+        let token = raw[idx].as_str();
+        if token == "--config" {
+            idx += 1;
+            if idx < raw.len() {
+                idx += 1;
+            }
+            continue;
+        }
+        if token.starts_with("--config=") {
+            idx += 1;
+            continue;
+        }
+        break;
+    }
+
+    if idx >= raw.len() {
+        return raw;
+    }
+    let first = raw[idx].as_str();
+    if known_subcommands.contains(&first) || first == "-h" || first == "--help" || first == "--version" {
+        return raw;
+    }
+
+    let mut out = Vec::with_capacity(raw.len() + 1);
+    out.extend_from_slice(&raw[..idx]);
+    out.push("llm".to_string());
+    out.extend_from_slice(&raw[idx..]);
+    out
 }
 
 fn inside_tmux() -> bool {
@@ -758,4 +829,48 @@ fn read_last_event(path: &Path) -> Option<Value> {
     let contents = fs::read_to_string(path).ok()?;
     let line = contents.lines().rev().find(|l| !l.trim().is_empty())?;
     serde_json::from_str(line).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_cli_args;
+
+    #[test]
+    fn normalize_cli_args_inserts_llm_for_prompt() {
+        let args = vec!["ai".to_string(), "Count to 5".to_string()];
+        let out = normalize_cli_args(args);
+        assert_eq!(out, vec!["ai", "llm", "Count to 5"]);
+    }
+
+    #[test]
+    fn normalize_cli_args_keeps_known_subcommand() {
+        let args = vec!["ai".to_string(), "launch".to_string()];
+        let out = normalize_cli_args(args);
+        assert_eq!(out, vec!["ai", "launch"]);
+    }
+
+    #[test]
+    fn normalize_cli_args_handles_config_prefix() {
+        let args = vec![
+            "ai".to_string(),
+            "--config".to_string(),
+            "/tmp/aish.json".to_string(),
+            "--provider".to_string(),
+            "local-3000".to_string(),
+            "Count".to_string(),
+        ];
+        let out = normalize_cli_args(args);
+        assert_eq!(
+            out,
+            vec![
+                "ai",
+                "--config",
+                "/tmp/aish.json",
+                "llm",
+                "--provider",
+                "local-3000",
+                "Count"
+            ]
+        );
+    }
 }
