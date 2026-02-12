@@ -4,7 +4,7 @@ use clap::{Parser, Subcommand};
 use serde_json::{json, Map, Value};
 use std::env;
 use std::fs;
-use std::io::IsTerminal;
+use std::io::{BufRead, BufReader, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread::sleep;
@@ -250,7 +250,11 @@ fn normalize_cli_args(raw: Vec<String>) -> Vec<String> {
         return raw;
     }
     let first = raw[idx].as_str();
-    if known_subcommands.contains(&first) || first == "-h" || first == "--help" || first == "--version" {
+    if known_subcommands.contains(&first)
+        || first == "-h"
+        || first == "--help"
+        || first == "--version"
+    {
         return raw;
     }
 
@@ -689,6 +693,7 @@ fn run_llm(
 
     let base_url = format!("http://{}:{}", cfg.server.hostname, cfg.server.port);
     let url = format!("{base_url}/v1/completions");
+    let stream_url = format!("{base_url}/v1/completions/stream");
 
     let mut body = json!({
         "prompt": prompt,
@@ -731,6 +736,23 @@ fn run_llm(
         None,
     );
 
+    let mut stream_body = body.clone();
+    stream_body["stream"] = json!(true);
+    if let Ok(out) = stream_completion_response(&stream_url, &stream_body) {
+        if !out.is_empty() && !out.ends_with('\n') {
+            println!();
+        }
+        let _ = write_log_event_value(
+            cfg,
+            "llm.response".to_string(),
+            json!({ "text": out }),
+            None,
+            None,
+            None,
+        );
+        return Ok(());
+    }
+
     let agent = ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(60))
         .build();
@@ -757,6 +779,98 @@ fn run_llm(
         println!("{}", serde_json::to_string_pretty(&value).unwrap_or(text));
     }
     Ok(())
+}
+
+fn stream_completion_response(url: &str, body: &Value) -> Result<String> {
+    let agent = ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(300))
+        .build();
+    let resp = agent
+        .post(url)
+        .set("Content-Type", "application/json")
+        .set("Accept", "text/event-stream")
+        .send_string(&body.to_string())
+        .with_context(|| "failed to call aishd /v1/completions/stream")?;
+
+    let mut reader = BufReader::new(resp.into_reader());
+    let mut line = String::new();
+    let mut event_type: Option<String> = None;
+    let mut data = String::new();
+    let mut full_text = String::new();
+
+    loop {
+        line.clear();
+        let read = reader.read_line(&mut line)?;
+        if read == 0 {
+            if !data.is_empty() && handle_sse_event(event_type.as_deref(), &data, &mut full_text)? {
+                break;
+            }
+            break;
+        }
+
+        let trimmed = line.trim_end_matches(&['\r', '\n'][..]);
+        if trimmed.is_empty() {
+            if !data.is_empty() {
+                if handle_sse_event(event_type.as_deref(), &data, &mut full_text)? {
+                    break;
+                }
+                data.clear();
+            }
+            event_type = None;
+            continue;
+        }
+
+        if let Some(rest) = trimmed.strip_prefix("event:") {
+            event_type = Some(rest.trim().to_string());
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("data:") {
+            if !data.is_empty() {
+                data.push('\n');
+            }
+            data.push_str(rest.trim_start());
+        }
+    }
+
+    Ok(full_text)
+}
+
+fn handle_sse_event(event_type: Option<&str>, data: &str, full_text: &mut String) -> Result<bool> {
+    match event_type.unwrap_or("delta") {
+        "delta" => {
+            let parsed: Value = serde_json::from_str(data).unwrap_or_else(|_| json!({}));
+            let delta = parsed
+                .get("delta")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            if !delta.is_empty() {
+                print!("{delta}");
+                std::io::stdout().flush()?;
+                full_text.push_str(delta);
+            }
+            Ok(false)
+        }
+        "done" => {
+            if full_text.is_empty() {
+                let parsed: Value = serde_json::from_str(data).unwrap_or_else(|_| json!({}));
+                if let Some(text) = parsed.get("text").and_then(|v| v.as_str()) {
+                    full_text.push_str(text);
+                    print!("{text}");
+                    std::io::stdout().flush()?;
+                }
+            }
+            Ok(true)
+        }
+        "error" => {
+            let parsed: Value = serde_json::from_str(data).unwrap_or_else(|_| json!({}));
+            let msg = parsed
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("streaming request failed");
+            bail!("{msg}");
+        }
+        _ => Ok(false),
+    }
 }
 
 fn extract_completion_text(value: &Value) -> Option<String> {
@@ -833,7 +947,7 @@ fn read_last_event(path: &Path) -> Option<Value> {
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_cli_args;
+    use super::{handle_sse_event, normalize_cli_args};
 
     #[test]
     fn normalize_cli_args_inserts_llm_for_prompt() {
@@ -872,5 +986,21 @@ mod tests {
                 "Count"
             ]
         );
+    }
+
+    #[test]
+    fn handle_sse_event_delta_appends_text() {
+        let mut full = String::new();
+        let done = handle_sse_event(Some("delta"), r#"{"delta":"abc"}"#, &mut full).unwrap();
+        assert!(!done);
+        assert_eq!(full, "abc");
+    }
+
+    #[test]
+    fn handle_sse_event_done_stops_stream() {
+        let mut full = String::new();
+        let done = handle_sse_event(Some("done"), r#"{"text":"final"}"#, &mut full).unwrap();
+        assert!(done);
+        assert_eq!(full, "final");
     }
 }

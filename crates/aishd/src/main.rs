@@ -17,6 +17,7 @@ use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -80,6 +81,7 @@ async fn main() -> Result<()> {
         .route("/health", get(health))
         .route("/version", get(version))
         .route("/v1/completions", post(completions))
+        .route("/v1/completions/stream", post(completions_stream))
         .route("/v1/sessions", get(list_sessions).post(create_session))
         .route("/v1/sessions/:id", get(get_session).patch(patch_session))
         .route(
@@ -169,6 +171,7 @@ async fn version() -> Json<Version> {
 struct CompletionRequest {
     prompt: Option<String>,
     messages: Option<Vec<ChatMessage>>,
+    stream: Option<bool>,
     session_id: Option<String>,
     context_mode: Option<String>,
     context_intent: Option<String>,
@@ -195,6 +198,12 @@ struct CompletionRequest {
     temperature: Option<f32>,
     top_p: Option<f32>,
     stop: Option<Vec<String>>,
+}
+
+enum CompletionStreamChunk {
+    Delta(String),
+    Done(String),
+    Error(String),
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -345,7 +354,9 @@ async fn completions(
         Err(resp) => return resp,
     };
     let provider = provider.clone();
-    let provider_for_ledger = provider_name.clone().unwrap_or_else(|| "default".to_string());
+    let provider_for_ledger = provider_name
+        .clone()
+        .unwrap_or_else(|| "default".to_string());
     let model_for_ledger = model.clone();
     let req_for_provider = req.clone();
     let result = tokio::task::spawn_blocking(move || {
@@ -420,6 +431,178 @@ async fn completions(
     }
 }
 
+async fn completions_stream(
+    State(state): State<AppState>,
+    Json(req): Json<CompletionRequest>,
+) -> Response {
+    let mut req = req;
+    req.stream = Some(true);
+    let requested_mode = parse_context_mode(req.context_mode.as_deref());
+    let session_for_ledger = req.session_id.clone();
+    let query_for_ledger = completion_query_text(&req);
+    let injected_context = maybe_inject_completion_context(&state, &mut req);
+
+    let cfg = &state.cfg;
+    let mut model = req.model.clone().unwrap_or_default();
+    let mut provider_name = req.provider.clone();
+
+    if provider_name.is_none() {
+        if let Some(model_name) = req.model.as_ref() {
+            if let Some(alias) = cfg.providers.model_aliases.get(model_name) {
+                provider_name = Some(alias.provider.clone());
+                model = alias.model.clone();
+            }
+        }
+    }
+
+    let provider = match resolve_provider(&cfg, provider_name.as_deref()) {
+        Ok(provider) => provider,
+        Err(resp) => return resp,
+    };
+
+    if provider.base_url.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "provider base_url is required"})),
+        )
+            .into_response();
+    }
+
+    if model.trim().is_empty() {
+        model = provider.model.clone();
+    }
+    if model.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "model is required"})),
+        )
+            .into_response();
+    }
+
+    let api_key = match resolve_api_key(provider, provider_name.as_deref()) {
+        Ok(key) => key,
+        Err(resp) => return resp,
+    };
+
+    let provider = provider.clone();
+    let provider_for_ledger = provider_name
+        .clone()
+        .unwrap_or_else(|| "default".to_string());
+    let model_for_ledger = model.clone();
+    let req_for_provider = req.clone();
+    let should_log_ledger = requested_mode != ContextMode::Off
+        && session_for_ledger.is_some()
+        && !query_for_ledger.trim().is_empty();
+    let (tx, rx) = mpsc::channel::<CompletionStreamChunk>(64);
+    let state_for_task = state.clone();
+
+    tokio::spawn(async move {
+        let tx_for_stream = tx.clone();
+        let provider_for_stream = provider.clone();
+        let api_key_for_stream = api_key.clone();
+        let model_for_stream = model.clone();
+        let req_for_stream = req_for_provider.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            call_openai_compat_completions_streaming(
+                &provider_for_stream,
+                &api_key_for_stream,
+                &model_for_stream,
+                &req_for_stream,
+                |delta| {
+                    let _ = tx_for_stream.blocking_send(CompletionStreamChunk::Delta(delta));
+                },
+            )
+        })
+        .await;
+
+        match result {
+            Ok(Ok(text)) => {
+                let _ = tx.send(CompletionStreamChunk::Done(text.clone())).await;
+                if should_log_ledger {
+                    let response = json!({
+                        "choices": [{"message": {"content": text}}],
+                    });
+                    log_completion_retrieval_ledger(
+                        &state_for_task,
+                        session_for_ledger.as_deref().unwrap_or_default(),
+                        &query_for_ledger,
+                        requested_mode,
+                        &req_for_provider,
+                        injected_context.as_ref(),
+                        Some(&response),
+                        "ok",
+                        None,
+                        &model_for_ledger,
+                        &provider_for_ledger,
+                    );
+                }
+            }
+            Ok(Err((status, value))) => {
+                let status = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
+                let err_msg = value
+                    .get("error")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| truncate_text_chars(&value.to_string(), 4_000));
+                let _ = tx
+                    .send(CompletionStreamChunk::Error(format!("{status}: {err_msg}")))
+                    .await;
+                if should_log_ledger {
+                    log_completion_retrieval_ledger(
+                        &state_for_task,
+                        session_for_ledger.as_deref().unwrap_or_default(),
+                        &query_for_ledger,
+                        requested_mode,
+                        &req_for_provider,
+                        injected_context.as_ref(),
+                        None,
+                        "provider_error",
+                        Some(truncate_text_chars(&value.to_string(), 4_000)),
+                        &model_for_ledger,
+                        &provider_for_ledger,
+                    );
+                }
+            }
+            Err(err) => {
+                let _ = tx
+                    .send(CompletionStreamChunk::Error(format!("join error: {err}")))
+                    .await;
+                if should_log_ledger {
+                    log_completion_retrieval_ledger(
+                        &state_for_task,
+                        session_for_ledger.as_deref().unwrap_or_default(),
+                        &query_for_ledger,
+                        requested_mode,
+                        &req_for_provider,
+                        injected_context.as_ref(),
+                        None,
+                        "join_error",
+                        Some(err.to_string()),
+                        &model_for_ledger,
+                        &provider_for_ledger,
+                    );
+                }
+            }
+        }
+    });
+
+    let stream = ReceiverStream::new(rx).map(|chunk| {
+        let event = match chunk {
+            CompletionStreamChunk::Delta(delta) => Event::default()
+                .event("delta")
+                .data(json!({ "delta": delta }).to_string()),
+            CompletionStreamChunk::Done(text) => Event::default()
+                .event("done")
+                .data(json!({ "text": text }).to_string()),
+            CompletionStreamChunk::Error(error) => Event::default()
+                .event("error")
+                .data(json!({ "error": error }).to_string()),
+        };
+        Ok::<Event, std::convert::Infallible>(event)
+    });
+    Sse::new(stream).into_response()
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ContextMode {
     Off,
@@ -465,7 +648,10 @@ struct LlmSelectedContext {
     selector_chunks: usize,
 }
 
-fn maybe_inject_completion_context(state: &AppState, req: &mut CompletionRequest) -> Option<InjectedContext> {
+fn maybe_inject_completion_context(
+    state: &AppState,
+    req: &mut CompletionRequest,
+) -> Option<InjectedContext> {
     let mode = parse_context_mode(req.context_mode.as_deref());
     if mode == ContextMode::Off {
         return None;
@@ -494,25 +680,29 @@ fn maybe_inject_completion_context(state: &AppState, req: &mut CompletionRequest
                 fallback_used: false,
             })
         } else {
-            deterministic_context_for_query(state, req, session_id, &query).map(|bundle| InjectedContext {
+            deterministic_context_for_query(state, req, session_id, &query).map(|bundle| {
+                InjectedContext {
+                    context_text: bundle.context_text,
+                    intent: Some(bundle.intent),
+                    retriever: bundle.retriever,
+                    selected_evidence_json: serde_json::to_string(&bundle.selected_evidence).ok(),
+                    selector_used: true,
+                    selector_chunks: 0,
+                    fallback_used: true,
+                }
+            })
+        }
+    } else {
+        deterministic_context_for_query(state, req, session_id, &query).map(|bundle| {
+            InjectedContext {
                 context_text: bundle.context_text,
                 intent: Some(bundle.intent),
                 retriever: bundle.retriever,
                 selected_evidence_json: serde_json::to_string(&bundle.selected_evidence).ok(),
-                selector_used: true,
+                selector_used: false,
                 selector_chunks: 0,
-                fallback_used: true,
-            })
-        }
-    } else {
-        deterministic_context_for_query(state, req, session_id, &query).map(|bundle| InjectedContext {
-            context_text: bundle.context_text,
-            intent: Some(bundle.intent),
-            retriever: bundle.retriever,
-            selected_evidence_json: serde_json::to_string(&bundle.selected_evidence).ok(),
-            selector_used: false,
-            selector_chunks: 0,
-            fallback_used: false,
+                fallback_used: false,
+            }
         })
     };
     let Some(selected) = selected else {
@@ -597,7 +787,10 @@ fn build_llm_selected_context(
         .context_selector_total_tokens_cap
         .unwrap_or(256_000)
         .clamp(4_000, 1_024_000);
-    let timeout_ms = req.context_selector_timeout_ms.unwrap_or(45_000).clamp(2_000, 180_000);
+    let timeout_ms = req
+        .context_selector_timeout_ms
+        .unwrap_or(45_000)
+        .clamp(2_000, 180_000);
     let early_stop = req.context_selector_early_stop.unwrap_or(true);
     let max_chunks_from_budget = (total_tokens_cap / chunk_tokens).max(1);
     let effective_max_chunks = max_chunks.min(max_chunks_from_budget);
@@ -841,9 +1034,11 @@ fn log_completion_retrieval_ledger(
         .and_then(extract_completion_text)
         .map(|text| truncate_text_chars(&text, 16_000));
     let answer_chars = answer_text.as_ref().map(|v| v.chars().count()).unwrap_or(0);
-    let context_text = injected
-        .map(|value| truncate_text_chars(&value.context_text, 24_000));
-    let context_chars = context_text.as_ref().map(|v| v.chars().count()).unwrap_or(0);
+    let context_text = injected.map(|value| truncate_text_chars(&value.context_text, 24_000));
+    let context_chars = context_text
+        .as_ref()
+        .map(|v| v.chars().count())
+        .unwrap_or(0);
     let intent = injected
         .and_then(|value| value.intent.clone())
         .or_else(|| req.context_intent.clone());
@@ -2374,6 +2569,141 @@ fn call_openai_compat_completions(
     }
 }
 
+fn call_openai_compat_completions_streaming<F>(
+    provider: &OpenAICompatConfig,
+    api_key: &str,
+    model: &str,
+    req: &CompletionRequest,
+    mut on_delta: F,
+) -> Result<String, (u16, Value)>
+where
+    F: FnMut(String),
+{
+    let url = if provider.completions_path.starts_with("http://")
+        || provider.completions_path.starts_with("https://")
+    {
+        provider.completions_path.clone()
+    } else {
+        let base = provider.base_url.trim_end_matches('/');
+        let path = if provider.completions_path.starts_with('/') {
+            provider.completions_path.clone()
+        } else {
+            format!("/{}", provider.completions_path)
+        };
+        format!("{base}{path}")
+    };
+
+    let is_chat = provider.completions_path.contains("chat/completions");
+    let mut body = json!({
+        "model": model,
+        "stream": true,
+    });
+    if is_chat {
+        let messages = if let Some(messages) = &req.messages {
+            messages.clone()
+        } else if let Some(prompt) = req.prompt.as_deref() {
+            if prompt.trim().is_empty() {
+                return Err((400, json!({"error": "prompt or messages required"})));
+            }
+            vec![ChatMessage {
+                role: "user".to_string(),
+                content: prompt.to_string(),
+            }]
+        } else {
+            return Err((400, json!({"error": "prompt or messages required"})));
+        };
+        body["messages"] = json!(messages);
+    } else {
+        let prompt = req.prompt.as_deref().unwrap_or_default();
+        if prompt.trim().is_empty() {
+            return Err((400, json!({"error": "prompt is required"})));
+        }
+        body["prompt"] = json!(prompt);
+    }
+    if let Some(max_tokens) = req.max_tokens {
+        body["max_tokens"] = json!(max_tokens);
+    }
+    if let Some(temperature) = req.temperature {
+        body["temperature"] = json!(temperature);
+    }
+    if let Some(top_p) = req.top_p {
+        body["top_p"] = json!(top_p);
+    }
+    if let Some(stop) = &req.stop {
+        body["stop"] = json!(stop);
+    }
+
+    let agent = ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(300))
+        .build();
+    let mut http = agent
+        .post(&url)
+        .set("Content-Type", "application/json")
+        .set("Accept", "text/event-stream");
+    if !api_key.trim().is_empty() {
+        http = http.set("Authorization", &format!("Bearer {}", api_key));
+    }
+    let response = http.send_string(&body.to_string());
+
+    match response {
+        Ok(resp) => {
+            let mut reader = BufReader::new(resp.into_reader());
+            let mut line = String::new();
+            let mut full_text = String::new();
+            while let Ok(read) = reader.read_line(&mut line) {
+                if read == 0 {
+                    break;
+                }
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    line.clear();
+                    continue;
+                }
+                let data = trimmed
+                    .strip_prefix("data:")
+                    .map(|v| v.trim())
+                    .unwrap_or(trimmed);
+                if data == "[DONE]" {
+                    break;
+                }
+                if let Ok(value) = serde_json::from_str::<Value>(data) {
+                    if let Some(delta) = extract_completion_delta_text(&value) {
+                        if !delta.is_empty() {
+                            on_delta(delta.clone());
+                            full_text.push_str(&delta);
+                        }
+                    } else if let Some(text) = extract_completion_text(&value) {
+                        if !text.is_empty() {
+                            on_delta(text.clone());
+                            full_text.push_str(&text);
+                        }
+                    }
+                }
+                line.clear();
+            }
+
+            if !full_text.is_empty() {
+                return Ok(full_text);
+            }
+
+            let fallback = call_openai_compat_completions(provider, api_key, model, req)?;
+            if let Some(text) = extract_completion_text(&fallback) {
+                if !text.is_empty() {
+                    on_delta(text.clone());
+                    return Ok(text);
+                }
+            }
+            Err((502, json!({"error": "no completion text returned"})))
+        }
+        Err(ureq::Error::Status(status, resp)) => {
+            let text = resp.into_string().unwrap_or_default();
+            let parsed = serde_json::from_str(&text).unwrap_or_else(|_| json!({ "raw": text }));
+            Err((status, parsed))
+        }
+        Err(err) => Err((502, json!({ "error": err.to_string() }))),
+    }
+}
+
 fn resolve_provider<'a>(
     cfg: &'a Config,
     provider_name: Option<&str>,
@@ -2474,6 +2804,7 @@ fn call_llm_with_messages(
     let req = CompletionRequest {
         prompt: None,
         messages: Some(messages.to_vec()),
+        stream: None,
         session_id: None,
         context_mode: None,
         context_intent: None,
@@ -2971,6 +3302,20 @@ fn extract_completion_text(value: &Value) -> Option<String> {
     None
 }
 
+fn extract_completion_delta_text(value: &Value) -> Option<String> {
+    let choices = value.get("choices")?.as_array()?;
+    let first = choices.first()?;
+    if let Some(delta) = first.get("delta") {
+        if let Some(content) = delta.get("content").and_then(|v| v.as_str()) {
+            return Some(content.to_string());
+        }
+    }
+    if let Some(text) = first.get("text").and_then(|v| v.as_str()) {
+        return Some(text.to_string());
+    }
+    None
+}
+
 fn tool_system_prompt() -> String {
     [
         "You are a tool-using assistant.",
@@ -3419,7 +3764,10 @@ fn run_mcp_web_search(cfg: &Config, args: Value) -> Result<Value, (StatusCode, V
     let args: McpWebSearchArgs = serde_json::from_value(args)
         .map_err(|e| (StatusCode::BAD_REQUEST, json!({"error": e.to_string()})))?;
     if args.query.trim().is_empty() {
-        return Err((StatusCode::BAD_REQUEST, json!({"error": "query is required"})));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            json!({"error": "query is required"}),
+        ));
     }
     match mcp_web_search(cfg, args.server.as_deref(), &args.query, args.max_results) {
         Ok(value) => Ok(value),
@@ -3440,16 +3788,13 @@ fn mcp_error_status(message: &str) -> StatusCode {
     }
 }
 
-fn mcp_list_tools(cfg: &Config, requested_server: Option<&str>) -> Result<(String, Vec<Value>), String> {
+fn mcp_list_tools(
+    cfg: &Config,
+    requested_server: Option<&str>,
+) -> Result<(String, Vec<Value>), String> {
     let (server_name, server) = resolve_mcp_server(cfg, requested_server)?;
     let session = mcp_initialize(server)?;
-    let response = mcp_jsonrpc_request(
-        server,
-        &session,
-        2,
-        "tools/list",
-        Some(json!({})),
-    )?;
+    let response = mcp_jsonrpc_request(server, &session, 2, "tools/list", Some(json!({})))?;
     let tools = response
         .get("result")
         .and_then(|v| v.get("tools"))
@@ -3467,13 +3812,7 @@ fn mcp_web_search(
 ) -> Result<Value, String> {
     let (server_name, server) = resolve_mcp_server(cfg, requested_server)?;
     let session = mcp_initialize(server)?;
-    let list_response = mcp_jsonrpc_request(
-        server,
-        &session,
-        2,
-        "tools/list",
-        Some(json!({})),
-    )?;
+    let list_response = mcp_jsonrpc_request(server, &session, 2, "tools/list", Some(json!({})))?;
     let tools = list_response
         .get("result")
         .and_then(|v| v.get("tools"))
@@ -3519,7 +3858,10 @@ fn resolve_mcp_server<'a>(
             .mcp_servers
             .get(name)
             .ok_or_else(|| format!("MCP server `{name}` not configured"))?;
-        if !server.transport_type.eq_ignore_ascii_case("streamable-http") {
+        if !server
+            .transport_type
+            .eq_ignore_ascii_case("streamable-http")
+        {
             return Err(format!(
                 "unsupported MCP transport `{}` for server `{name}`",
                 server.transport_type
@@ -3531,14 +3873,20 @@ fn resolve_mcp_server<'a>(
         return Ok((name, server));
     }
     if let Some(server) = cfg.mcp_servers.get("web-search-prime") {
-        if server.transport_type.eq_ignore_ascii_case("streamable-http") && !server.url.trim().is_empty()
+        if server
+            .transport_type
+            .eq_ignore_ascii_case("streamable-http")
+            && !server.url.trim().is_empty()
         {
             return Ok(("web-search-prime", server));
         }
     }
     if cfg.mcp_servers.len() == 1 {
         if let Some((name, server)) = cfg.mcp_servers.iter().next() {
-            if !server.transport_type.eq_ignore_ascii_case("streamable-http") {
+            if !server
+                .transport_type
+                .eq_ignore_ascii_case("streamable-http")
+            {
                 return Err(format!(
                     "unsupported MCP transport `{}` for server `{name}`",
                     server.transport_type
@@ -3641,7 +3989,10 @@ fn mcp_post(
     let mut req = agent
         .post(server.url.trim())
         .set("Content-Type", "application/json")
-        .set("Accept", "application/json, application/json-seq, text/event-stream");
+        .set(
+            "Accept",
+            "application/json, application/json-seq, text/event-stream",
+        );
     if let Some(session_id) = session_id {
         req = req.set("Mcp-Session-Id", session_id);
     }
@@ -3739,8 +4090,13 @@ fn mcp_error_from_payload(payload: &Value) -> Option<String> {
 
 fn expand_mcp_header_value(raw: &str) -> Result<String, String> {
     let mut value = raw.to_string();
-    let zai_api_key = env::var("ZAI_API_KEY").ok().filter(|v| !v.trim().is_empty());
-    if value.contains("${ZAI_API_KEY}") || value.contains("$ZAI_API_KEY") || value.contains("your_api_key") {
+    let zai_api_key = env::var("ZAI_API_KEY")
+        .ok()
+        .filter(|v| !v.trim().is_empty());
+    if value.contains("${ZAI_API_KEY}")
+        || value.contains("$ZAI_API_KEY")
+        || value.contains("your_api_key")
+    {
         let token = zai_api_key.ok_or_else(|| {
             "MCP header references ZAI API key but ZAI_API_KEY is not set".to_string()
         })?;
@@ -4132,6 +4488,7 @@ mod tests {
         let req = CompletionRequest {
             prompt: Some("q".to_string()),
             messages: None,
+            stream: None,
             session_id: Some("sess_1".to_string()),
             context_mode: Some("always".to_string()),
             context_intent: None,
@@ -4159,7 +4516,10 @@ mod tests {
             top_p: None,
             stop: None,
         };
-        assert_eq!(configured_retriever_label(&req, ContextMode::Always), "bm25");
+        assert_eq!(
+            configured_retriever_label(&req, ContextMode::Always),
+            "bm25"
+        );
         assert_eq!(
             configured_retriever_label(&req, ContextMode::LlmSelect),
             "llm-select"
@@ -4171,6 +4531,7 @@ mod tests {
         let req = CompletionRequest {
             prompt: Some("q".to_string()),
             messages: None,
+            stream: None,
             session_id: Some("sess_1".to_string()),
             context_mode: Some("always".to_string()),
             context_intent: None,
@@ -4198,7 +4559,10 @@ mod tests {
             top_p: None,
             stop: None,
         };
-        assert_eq!(configured_retriever_label(&req, ContextMode::Always), "lexical");
+        assert_eq!(
+            configured_retriever_label(&req, ContextMode::Always),
+            "lexical"
+        );
     }
 
     #[test]
@@ -4287,6 +4651,34 @@ mod tests {
     fn truncate_text_chars_adds_ellipsis_when_needed() {
         assert_eq!(truncate_text_chars("abc", 10), "abc");
         assert_eq!(truncate_text_chars("abcdef", 3), "abc...");
+    }
+
+    #[test]
+    fn extract_completion_delta_text_from_chat_chunk() {
+        let value = json!({
+            "choices": [{
+                "delta": {"content": "hello"},
+                "index": 0
+            }]
+        });
+        assert_eq!(
+            extract_completion_delta_text(&value).as_deref(),
+            Some("hello")
+        );
+    }
+
+    #[test]
+    fn extract_completion_delta_text_from_legacy_text_chunk() {
+        let value = json!({
+            "choices": [{
+                "text": "world",
+                "index": 0
+            }]
+        });
+        assert_eq!(
+            extract_completion_delta_text(&value).as_deref(),
+            Some("world")
+        );
     }
 }
 
