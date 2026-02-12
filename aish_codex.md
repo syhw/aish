@@ -3,7 +3,7 @@
 Design document for **aish (AI SHell)**.
 
 ## Summary
-aish (AI SHell) is a zsh-compatible shell (or zsh extension) that runs inside tmux, logs all activity, and embeds an always-on agentic LLM. The user interacts like a normal shell, but can invoke the agent with `llm ...` to run an agent loop that can spawn subagents, manage worktrees, and run tools. aish is split into a server and client so sessions can be shared as webpages.
+aish (AI SHell) is a zsh-compatible shell (or zsh extension) that runs inside tmux, logs all activity, and embeds an always-on agentic LLM. The user interacts like a normal shell, but can invoke the agent with `ai ...` to run an agent loop that can spawn subagents, manage worktrees, and run tools. aish is split into a server and client so sessions can be shared as webpages.
 
 ## Goals
 - zsh-compatible (plugin + optional wrapper shell).
@@ -70,7 +70,7 @@ aish (AI SHell) is a zsh-compatible shell (or zsh extension) that runs inside tm
 
 2. **aish-client**
    - zsh plugin + optional TUI.
-   - Captures user commands, wraps `llm` prompt, sends to aish-server.
+   - Captures user commands, wraps `ai` prompt, sends to aish-server.
    - Can attach to an existing server (like `aish attach http://host:port`).
 
 3. **aish-server (aishd)**
@@ -195,7 +195,7 @@ Tools are Python helpers executed by aishd:
 - Results are streamed back into the session context.
 
 ## Agent Execution (Detailed)
-When the user runs `llm ...`, aishd builds a per-request execution context:
+When the user runs `ai ...`, aishd builds a per-request execution context:
 1. Resolve toolset: global defaults -> session overrides -> request overrides.
 2. Resolve prompt pack: global -> session -> request.
 3. Spawn (or reuse) agent runtime in its own tmux session.
@@ -229,13 +229,13 @@ Subagents follow the same pattern.
 - Prompt packs are selected at three layers:
   - **Global**: `~/.config/aish/prompts/default.toml`
   - **Session**: per-session override in aishd metadata
-  - **Request**: `llm --prompt @name`
+  - **Request**: `ai --prompt @name`
 
 ### Toolset Selection
 - Toolsets are also layered:
   - **Global**: default enabled tools in config
   - **Session**: `aish session config set tools=@minimal`
-  - **Request**: `llm --tools shell,fs,git`
+  - **Request**: `ai --tools shell,fs,git`
 
 ### Tool Policy & Approval
 - Default policy: `ask`
@@ -398,11 +398,11 @@ Config file: `aish.json`
 - `aish session config set <id> tools=@minimal prompt=@coding` -> set overrides
 
 Inside shell:
-- `llm <prompt>` -> run agentic loop in current session
-- `llm --tools shell,fs,git` -> override toolset for a request
-- `llm --prompt @coding` -> override prompt pack for a request
-- `llm --new` -> create new session
-- `llm --attach <id>` -> attach to session
+- `ai <prompt>` -> run agentic loop in current session
+- `ai --tools shell,fs,git` -> override toolset for a request
+- `ai --prompt @coding` -> override prompt pack for a request
+- `ai --new` -> create new session
+- `ai --attach <id>` -> attach to session
 
 ## Resume Notes (Codex)
 - Project root: `/Users/gab/aish_codex`
@@ -427,7 +427,7 @@ Inside shell:
 ## Milestones
 1. **MVP**
    - tmux enforcement
-   - zsh plugin (hooks + `llm` command)
+   - zsh plugin (hooks + `ai` command)
    - aishd with HTTP API
    - log pipeline (PTY + JSONL)
 2. **Web UI**

@@ -60,8 +60,7 @@ Run and verify:
 ai ensure-daemon
 curl -fsS http://127.0.0.1:5033/health
 ai "Say hello in one sentence."
-ai llm "Say hello in one sentence."
-ai llm --provider local-3000 --model gemini-3-pro-preview "Count to 5 slowly"
+ai --provider local-3000 --model gemini-3-pro-preview "Count to 5 slowly"
 ```
 
 ## Architecture
@@ -78,7 +77,7 @@ ai llm --provider local-3000 --model gemini-3-pro-preview "Count to 5 slowly"
 | (zsh + aish hook) | <---SSE/JSON---------+-------------------------------+
 +---------+---------+                      | sessions/agents/runs registry |
           |                                | subagents + flows             |
-          | aish launch/llm/status         | tool runtime (shell/fs.*)     |
+          | aish launch/ai/status          | tool runtime (shell/fs.*)     |
           v                                +-----+--------------------+----+
 +-------------------+                            |                    |
 | aish CLI client   |                            |                    |
@@ -118,14 +117,14 @@ ai llm --provider local-3000 --model gemini-3-pro-preview "Count to 5 slowly"
 Primary commands:
 - `aish launch`: starts aishd if needed and launches a tmux-backed shell.
 - `aish serve`: starts aishd only.
-- `aish llm ...`: calls `/v1/completions` via aishd (reads stdin if no prompt).
+- `ai ...`: calls `/v1/completions` via aishd (reads stdin if no prompt).
 - `aish status`: shows recent sessions and log locations.
 - `aish ensure-daemon [--quiet]`: checks health and starts `aishd` when needed.
-- `ai "prompt"`: shortcut for `ai llm "prompt"` (and `echo "prompt" | ai` works too).
+- `ai "prompt"`: primary prompt command (and `echo "prompt" | ai` works too).
 
 Shell hooks:
 - `aish launch` writes hooks to `~/.config/aish/aish.zsh` and uses `ZDOTDIR=~/.config/aish/zdot`.
-- Hooks log command start/end events and add an `llm` shell function that maps to `aish llm`.
+- Hooks log command start/end events and keep a legacy `llm` shell function for compatibility.
 
 ## Configuration
 Default config file:
@@ -262,7 +261,7 @@ Context bundle retrieval:
 `context_text`, `selected_evidence`, `failing_commands`, `failing_tools`, `related_commands`, `related_output`, and `recent_edits`.
 
 How context is included in LLM calls:
-- `aish llm` automatically sends `session_id` and `context_mode: "diagnostic"` when `AISH_SESSION_ID` is set (for example inside `aish launch`).
+- `ai` automatically sends `session_id` and `context_mode: "diagnostic"` when `AISH_SESSION_ID` is set (for example inside `aish launch`).
 - For direct API usage, pass `session_id` and `context_mode` to `/v1/completions`.
 - Diagnostic mode is optimized for questions like:
 `"what did I do wrong?"`, `"why did this command fail?"`, `"what changed in this session?"`.
@@ -280,7 +279,7 @@ scripts/test_resume_workflow.sh
 
 ## Usage Examples
 See `EXAMPLES.md` for copy-paste workflows covering:
-- `aish launch` / `aish serve` / `aish llm`
+- `aish launch` / `aish serve` / `ai`
 - session/agent/subagent/flow API usage
 - restart/resume and troubleshooting patterns
 

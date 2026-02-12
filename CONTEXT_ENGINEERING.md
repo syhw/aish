@@ -149,7 +149,7 @@ JSON
 
 cat > "$AISH_LOG_DIR/$SID/stdin.log" <<'TXT'
 cargo test --workspace
-llm resume from where we left off
+ai resume from where we left off
 TXT
 
 cat > "$AISH_LOG_DIR/$SID/stderr.log" <<'TXT'
@@ -238,7 +238,7 @@ Expected:
 - `artifacts` is empty.
 - Failures/incidents/output still drive retrieval.
 
-## How this maps to `llm` calls
+## How this maps to `ai` calls
 
 `POST /v1/completions` supports:
 

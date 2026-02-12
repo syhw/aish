@@ -33,13 +33,13 @@ Launch tmux-backed shell:
 Ask the model:
 
 ```bash
-./target/debug/aish llm "Summarize this repository in 5 bullets."
+ai "Summarize this repository in 5 bullets."
 ```
 
 Pipe prompt from stdin:
 
 ```bash
-echo "What did I do wrong in this session?" | ./target/debug/aish llm
+echo "What did I do wrong in this session?" | ai
 ```
 
 Show status:
@@ -239,7 +239,7 @@ curl -fsS -X POST "$AISHD_URL/v1/tools/mcp.web_search/call" \
 
 ## 12) `ai` shortcut usage and context/prompt composition
 
-Basic shortcut (`ai` == `ai llm`):
+Basic usage:
 
 ```bash
 ai "Summarize this repo in 5 bullets."
