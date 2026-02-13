@@ -201,6 +201,7 @@ struct CompletionRequest {
 }
 
 enum CompletionStreamChunk {
+    Status(String),
     Delta(String),
     Done(String),
     Error(String),
@@ -497,11 +498,25 @@ async fn completions_stream(
     let state_for_task = state.clone();
 
     tokio::spawn(async move {
+        let _ = tx
+            .send(CompletionStreamChunk::Status(completion_phase_label(
+                &req_for_provider,
+                "prepare",
+            )))
+            .await;
+        let _ = tx
+            .send(CompletionStreamChunk::Status(completion_phase_label(
+                &req_for_provider,
+                "provider",
+            )))
+            .await;
         let tx_for_stream = tx.clone();
         let provider_for_stream = provider.clone();
         let api_key_for_stream = api_key.clone();
         let model_for_stream = model.clone();
         let req_for_stream = req_for_provider.clone();
+        let first_chunk_seen = Arc::new(AtomicBool::new(false));
+        let first_chunk_seen_for_stream = first_chunk_seen.clone();
         let result = tokio::task::spawn_blocking(move || {
             call_openai_compat_completions_streaming(
                 &provider_for_stream,
@@ -509,6 +524,11 @@ async fn completions_stream(
                 &model_for_stream,
                 &req_for_stream,
                 |delta| {
+                    if !first_chunk_seen_for_stream.swap(true, Ordering::SeqCst) {
+                        let _ = tx_for_stream.blocking_send(CompletionStreamChunk::Status(
+                            completion_phase_label(&req_for_stream, "stream"),
+                        ));
+                    }
                     let _ = tx_for_stream.blocking_send(CompletionStreamChunk::Delta(delta));
                 },
             )
@@ -588,6 +608,9 @@ async fn completions_stream(
 
     let stream = ReceiverStream::new(rx).map(|chunk| {
         let event = match chunk {
+            CompletionStreamChunk::Status(status) => Event::default()
+                .event("status")
+                .data(json!({ "status": status }).to_string()),
             CompletionStreamChunk::Delta(delta) => Event::default()
                 .event("delta")
                 .data(json!({ "delta": delta }).to_string()),
@@ -628,6 +651,26 @@ fn parse_context_mode(value: Option<&str>) -> ContextMode {
         "diagnostic" => ContextMode::Diagnostic,
         "llm-select" | "llm_select" | "selector" => ContextMode::LlmSelect,
         _ => ContextMode::Off,
+    }
+}
+
+fn completion_phase_label(req: &CompletionRequest, stage: &str) -> String {
+    let mode = parse_context_mode(req.context_mode.as_deref());
+    match stage {
+        "prepare" => match mode {
+            ContextMode::LlmSelect => "Selecting relevant context (LLM selector)...".to_string(),
+            ContextMode::Always | ContextMode::Diagnostic => {
+                if req.session_id.is_some() {
+                    "Selecting relevant context...".to_string()
+                } else {
+                    "Preparing model request...".to_string()
+                }
+            }
+            ContextMode::Off => "Preparing model request...".to_string(),
+        },
+        "provider" => "Calling model provider...".to_string(),
+        "stream" => "Streaming response...".to_string(),
+        _ => "Working...".to_string(),
     }
 }
 
@@ -2543,6 +2586,9 @@ fn call_openai_compat_completions(
     }
     if let Some(stop) = &req.stop {
         body["stop"] = json!(stop);
+    }
+    if req.stream == Some(true) {
+        body["stream"] = json!(true);
     }
 
     let agent = ureq::AgentBuilder::new()

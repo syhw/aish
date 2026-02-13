@@ -7,8 +7,9 @@ use std::fs;
 use std::io::{BufRead, BufReader, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::thread::sleep;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::mpsc::{self, RecvTimeoutError, Sender};
+use std::thread::{self, sleep};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Parser)]
 #[command(name = "aish", version, about = "AI SHell launcher")]
@@ -934,7 +935,114 @@ fn indented_block(text: &str) -> String {
         .join("\n")
 }
 
+enum StreamChannelMessage {
+    Event {
+        event_type: Option<String>,
+        data: String,
+    },
+    End,
+}
+
+struct ProgressLine {
+    enabled: bool,
+    current_status: String,
+    started_at: Instant,
+    last_rendered_at: Instant,
+}
+
+impl ProgressLine {
+    fn new(enabled: bool) -> Self {
+        let now = Instant::now();
+        Self {
+            enabled,
+            current_status: "Preparing request...".to_string(),
+            started_at: now,
+            last_rendered_at: now.checked_sub(Duration::from_secs(3)).unwrap_or(now),
+        }
+    }
+
+    fn set_status(&mut self, status: &str) {
+        if self.current_status == status {
+            return;
+        }
+        self.current_status = status.to_string();
+        self.render(true);
+    }
+
+    fn tick(&mut self) {
+        self.render(false);
+    }
+
+    fn clear(&mut self) {
+        if !self.enabled {
+            return;
+        }
+        eprint!("\r\x1b[2K");
+        let _ = std::io::stderr().flush();
+    }
+
+    fn stop(&mut self) {
+        self.clear();
+        self.enabled = false;
+    }
+
+    fn render(&mut self, force: bool) {
+        if !self.enabled {
+            return;
+        }
+        let now = Instant::now();
+        if !force && now.duration_since(self.last_rendered_at) < Duration::from_secs(3) {
+            return;
+        }
+        let elapsed = now.duration_since(self.started_at).as_secs();
+        eprint!("\r\x1b[2K[ai] {} ({}s)", self.current_status, elapsed);
+        let _ = std::io::stderr().flush();
+        self.last_rendered_at = now;
+    }
+}
+
 fn stream_completion_response(url: &str, body: &Value) -> Result<String> {
+    let mut progress = ProgressLine::new(std::io::stderr().is_terminal());
+    progress.render(true);
+    let (tx, rx) = mpsc::channel::<StreamChannelMessage>();
+    let request_url = url.to_string();
+    let request_body = body.to_string();
+    let worker = thread::spawn(move || stream_completion_worker(&request_url, &request_body, tx));
+
+    let mut full_text = String::new();
+    let mut done = false;
+
+    loop {
+        match rx.recv_timeout(Duration::from_secs(3)) {
+            Ok(StreamChannelMessage::Event { event_type, data }) => {
+                if handle_sse_event(event_type.as_deref(), &data, &mut full_text, &mut progress)? {
+                    done = true;
+                    break;
+                }
+            }
+            Ok(StreamChannelMessage::End) => break,
+            Err(RecvTimeoutError::Timeout) => progress.tick(),
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+    }
+
+    progress.clear();
+    match worker.join() {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => {
+            if !done && full_text.is_empty() {
+                return Err(err);
+            }
+        }
+        Err(_) => bail!("stream worker panicked"),
+    }
+    if !done && full_text.is_empty() {
+        bail!("no completion text returned");
+    }
+    Ok(full_text)
+}
+
+fn stream_completion_worker(url: &str, body: &str, tx: Sender<StreamChannelMessage>) -> Result<()> {
     let agent = ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(300))
         .build();
@@ -942,37 +1050,40 @@ fn stream_completion_response(url: &str, body: &Value) -> Result<String> {
         .post(url)
         .set("Content-Type", "application/json")
         .set("Accept", "text/event-stream")
-        .send_string(&body.to_string())
+        .send_string(body)
         .with_context(|| "failed to call aishd /v1/completions/stream")?;
 
     let mut reader = BufReader::new(resp.into_reader());
     let mut line = String::new();
     let mut event_type: Option<String> = None;
     let mut data = String::new();
-    let mut full_text = String::new();
 
     loop {
         line.clear();
         let read = reader.read_line(&mut line)?;
         if read == 0 {
-            if !data.is_empty() && handle_sse_event(event_type.as_deref(), &data, &mut full_text)? {
-                break;
+            if !data.is_empty() {
+                let _ = tx.send(StreamChannelMessage::Event {
+                    event_type: event_type.clone(),
+                    data: data.clone(),
+                });
             }
+            let _ = tx.send(StreamChannelMessage::End);
             break;
         }
 
         let trimmed = line.trim_end_matches(&['\r', '\n'][..]);
         if trimmed.is_empty() {
             if !data.is_empty() {
-                if handle_sse_event(event_type.as_deref(), &data, &mut full_text)? {
-                    break;
-                }
+                let _ = tx.send(StreamChannelMessage::Event {
+                    event_type: event_type.clone(),
+                    data: data.clone(),
+                });
                 data.clear();
             }
             event_type = None;
             continue;
         }
-
         if let Some(rest) = trimmed.strip_prefix("event:") {
             event_type = Some(rest.trim().to_string());
             continue;
@@ -985,11 +1096,23 @@ fn stream_completion_response(url: &str, body: &Value) -> Result<String> {
         }
     }
 
-    Ok(full_text)
+    Ok(())
 }
 
-fn handle_sse_event(event_type: Option<&str>, data: &str, full_text: &mut String) -> Result<bool> {
+fn handle_sse_event(
+    event_type: Option<&str>,
+    data: &str,
+    full_text: &mut String,
+    progress: &mut ProgressLine,
+) -> Result<bool> {
     match event_type.unwrap_or("delta") {
+        "status" => {
+            let parsed: Value = serde_json::from_str(data).unwrap_or_else(|_| json!({}));
+            if let Some(status) = parsed.get("status").and_then(|v| v.as_str()) {
+                progress.set_status(status);
+            }
+            Ok(false)
+        }
         "delta" => {
             let parsed: Value = serde_json::from_str(data).unwrap_or_else(|_| json!({}));
             let delta = parsed
@@ -997,6 +1120,9 @@ fn handle_sse_event(event_type: Option<&str>, data: &str, full_text: &mut String
                 .and_then(|v| v.as_str())
                 .unwrap_or_default();
             if !delta.is_empty() {
+                if full_text.is_empty() {
+                    progress.stop();
+                }
                 print!("{delta}");
                 std::io::stdout().flush()?;
                 full_text.push_str(delta);
@@ -1007,11 +1133,13 @@ fn handle_sse_event(event_type: Option<&str>, data: &str, full_text: &mut String
             if full_text.is_empty() {
                 let parsed: Value = serde_json::from_str(data).unwrap_or_else(|_| json!({}));
                 if let Some(text) = parsed.get("text").and_then(|v| v.as_str()) {
+                    progress.stop();
                     full_text.push_str(text);
                     print!("{text}");
                     std::io::stdout().flush()?;
                 }
             }
+            progress.stop();
             Ok(true)
         }
         "error" => {
@@ -1020,6 +1148,7 @@ fn handle_sse_event(event_type: Option<&str>, data: &str, full_text: &mut String
                 .get("error")
                 .and_then(|v| v.as_str())
                 .unwrap_or("streaming request failed");
+            progress.stop();
             bail!("{msg}");
         }
         _ => Ok(false),
@@ -1100,7 +1229,9 @@ fn read_last_event(path: &Path) -> Option<Value> {
 
 #[cfg(test)]
 mod tests {
-    use super::{handle_sse_event, normalize_cli_args, should_attach_workspace_context};
+    use super::{
+        handle_sse_event, normalize_cli_args, should_attach_workspace_context, ProgressLine,
+    };
 
     #[test]
     fn normalize_cli_args_inserts_llm_for_prompt() {
@@ -1144,7 +1275,14 @@ mod tests {
     #[test]
     fn handle_sse_event_delta_appends_text() {
         let mut full = String::new();
-        let done = handle_sse_event(Some("delta"), r#"{"delta":"abc"}"#, &mut full).unwrap();
+        let mut progress = ProgressLine::new(false);
+        let done = handle_sse_event(
+            Some("delta"),
+            r#"{"delta":"abc"}"#,
+            &mut full,
+            &mut progress,
+        )
+        .unwrap();
         assert!(!done);
         assert_eq!(full, "abc");
     }
@@ -1152,9 +1290,31 @@ mod tests {
     #[test]
     fn handle_sse_event_done_stops_stream() {
         let mut full = String::new();
-        let done = handle_sse_event(Some("done"), r#"{"text":"final"}"#, &mut full).unwrap();
+        let mut progress = ProgressLine::new(false);
+        let done = handle_sse_event(
+            Some("done"),
+            r#"{"text":"final"}"#,
+            &mut full,
+            &mut progress,
+        )
+        .unwrap();
         assert!(done);
         assert_eq!(full, "final");
+    }
+
+    #[test]
+    fn handle_sse_event_status_updates_progress_label() {
+        let mut full = String::new();
+        let mut progress = ProgressLine::new(false);
+        let done = handle_sse_event(
+            Some("status"),
+            r#"{"status":"Selecting relevant context..."}"#,
+            &mut full,
+            &mut progress,
+        )
+        .unwrap();
+        assert!(!done);
+        assert_eq!(progress.current_status, "Selecting relevant context...");
     }
 
     #[test]
