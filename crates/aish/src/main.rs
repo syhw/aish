@@ -690,6 +690,7 @@ fn run_llm(
     if prompt.trim().is_empty() {
         bail!("prompt is empty");
     }
+    let prompt = maybe_attach_workspace_context(&prompt);
 
     let base_url = format!("http://{}:{}", cfg.server.hostname, cfg.server.port);
     let url = format!("{base_url}/v1/completions");
@@ -779,6 +780,158 @@ fn run_llm(
         println!("{}", serde_json::to_string_pretty(&value).unwrap_or(text));
     }
     Ok(())
+}
+
+fn maybe_attach_workspace_context(prompt: &str) -> String {
+    if !should_attach_workspace_context(prompt) {
+        return prompt.to_string();
+    }
+    match collect_workspace_context() {
+        Some(ctx) => format!(
+            "You are answering a question about the user's local workspace.\nUse the provided workspace context as source material.\nIf information is missing, say so briefly.\n\nWorkspace context:\n{ctx}\n\nUser request:\n{prompt}"
+        ),
+        None => prompt.to_string(),
+    }
+}
+
+fn should_attach_workspace_context(prompt: &str) -> bool {
+    let p = prompt.to_lowercase();
+    [
+        "this repository",
+        "this repo",
+        "this folder",
+        "this directory",
+        "current directory",
+        "current folder",
+        "current repo",
+        "this project",
+        "summarize this repository",
+        "summarize this folder",
+    ]
+    .iter()
+    .any(|needle| p.contains(needle))
+}
+
+fn collect_workspace_context() -> Option<String> {
+    let cwd = env::current_dir().ok()?;
+    let mut lines = Vec::new();
+    lines.push(format!("- cwd: {}", cwd.display()));
+
+    let repo_root = run_command_capture(Some(&cwd), "git", &["rev-parse", "--show-toplevel"])
+        .map(PathBuf::from);
+    if let Some(root) = &repo_root {
+        lines.push(format!("- repo_root: {}", root.display()));
+        if let Some(branch) =
+            run_command_capture(Some(root), "git", &["rev-parse", "--abbrev-ref", "HEAD"])
+        {
+            lines.push(format!("- git_branch: {}", branch));
+        }
+        if let Some(status) = run_command_capture(Some(root), "git", &["status", "--short"]) {
+            let status = truncate_chars(&status, 2_000);
+            if !status.trim().is_empty() {
+                lines.push("- git_status_short:".to_string());
+                lines.push(indented_block(&status));
+            }
+        }
+        if let Some(files) = run_command_capture(Some(root), "git", &["ls-files"]) {
+            let mut listed = Vec::new();
+            for line in files.lines().take(200) {
+                listed.push(line.to_string());
+            }
+            if !listed.is_empty() {
+                lines.push("- tracked_files_sample:".to_string());
+                lines.push(indented_block(&listed.join("\n")));
+            }
+        }
+    }
+
+    let list_target = repo_root.as_ref().unwrap_or(&cwd);
+    if let Some(entries) = list_dir_entries(list_target, 120) {
+        lines.push("- top_level_entries:".to_string());
+        lines.push(indented_block(&entries.join("\n")));
+    }
+
+    if let Some(readme) = read_readme_excerpt(list_target, 4_000) {
+        lines.push("- readme_excerpt:".to_string());
+        lines.push(indented_block(&readme));
+    }
+
+    Some(lines.join("\n"))
+}
+
+fn run_command_capture(cwd: Option<&Path>, program: &str, args: &[&str]) -> Option<String> {
+    let mut cmd = Command::new(program);
+    cmd.args(args);
+    if let Some(dir) = cwd {
+        cmd.current_dir(dir);
+    }
+    let output = cmd.output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}
+
+fn list_dir_entries(path: &Path, limit: usize) -> Option<Vec<String>> {
+    let mut out = Vec::new();
+    let mut names = Vec::new();
+    for entry in fs::read_dir(path).ok()?.flatten() {
+        let p = entry.path();
+        let mut name = entry.file_name().to_string_lossy().to_string();
+        if p.is_dir() {
+            name.push('/');
+        }
+        names.push(name);
+    }
+    names.sort();
+    for name in names.into_iter().take(limit) {
+        out.push(name);
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+fn read_readme_excerpt(root: &Path, max_chars: usize) -> Option<String> {
+    let candidates = ["README.md", "Readme.md", "readme.md"];
+    for name in candidates {
+        let path = root.join(name);
+        if let Ok(text) = fs::read_to_string(path) {
+            let trimmed = truncate_chars(text.trim(), max_chars);
+            if !trimmed.is_empty() {
+                return Some(trimmed);
+            }
+        }
+    }
+    None
+}
+
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    let mut out = String::new();
+    for ch in text.chars().take(max_chars) {
+        out.push(ch);
+    }
+    if text.chars().count() > max_chars {
+        out.push_str("...");
+    }
+    out
+}
+
+fn indented_block(text: &str) -> String {
+    text.lines()
+        .map(|line| format!("  {}", line))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn stream_completion_response(url: &str, body: &Value) -> Result<String> {
@@ -947,7 +1100,7 @@ fn read_last_event(path: &Path) -> Option<Value> {
 
 #[cfg(test)]
 mod tests {
-    use super::{handle_sse_event, normalize_cli_args};
+    use super::{handle_sse_event, normalize_cli_args, should_attach_workspace_context};
 
     #[test]
     fn normalize_cli_args_inserts_llm_for_prompt() {
@@ -1002,5 +1155,20 @@ mod tests {
         let done = handle_sse_event(Some("done"), r#"{"text":"final"}"#, &mut full).unwrap();
         assert!(done);
         assert_eq!(full, "final");
+    }
+
+    #[test]
+    fn should_attach_workspace_context_detects_repo_phrasing() {
+        assert!(should_attach_workspace_context(
+            "Summarize this repository in 5 bullets."
+        ));
+        assert!(should_attach_workspace_context(
+            "Summarize this folder / repository in 5 bullets."
+        ));
+    }
+
+    #[test]
+    fn should_attach_workspace_context_ignores_general_prompts() {
+        assert!(!should_attach_workspace_context("Count to 5 slowly."));
     }
 }
