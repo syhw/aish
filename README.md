@@ -31,6 +31,18 @@ cat > ~/.config/aish/aish.json <<'JSON'
         "completions_path": "/chat/completions",
         "api_key_env": "TOGETHER_API_KEY"
       },
+      "mistral": {
+        "base_url": "https://api.mistral.ai",
+        "model": "devstral-small-latest",
+        "completions_path": "/v1/chat/completions",
+        "api_key_env": "MISTRAL_API_KEY"
+      },
+      "cerebras": {
+        "base_url": "https://api.cerebras.ai",
+        "model": "zai-glm-4.7",
+        "completions_path": "/v1/chat/completions",
+        "api_key_env": "CEREBRAS_API_KEY"
+      },
       "local-3000": {
         "base_url": "http://localhost:3000",
         "model": "gemini-3-pro-preview",
@@ -38,7 +50,9 @@ cat > ~/.config/aish/aish.json <<'JSON'
       }
     },
     "model_aliases": {
-      "kimi-k2.5": { "provider": "together", "model": "moonshotai/Kimi-K2.5" }
+      "kimi-k2.5": { "provider": "together", "model": "moonshotai/Kimi-K2.5" },
+      "devstral": { "provider": "mistral", "model": "devstral-small-latest" },
+      "zai-glm-4.7-cerebras": { "provider": "cerebras", "model": "zai-glm-4.7" }
     }
   },
   "tools": { "default_policy": "ask" },
@@ -97,9 +111,66 @@ ai --provider local-3000 --model gemini-3-pro-preview "Count to 5 slowly"
                           +----------------------------------------------+
 ```
 
+## Example
+
+```
+ gab  ~/gsh_codex   main ±  ai write a poem inspired by all my logs
+**The Engine's Echo**
+
+In the rust-lang depths where cargo builds,
+a daemon wakes, aish unfolds.
+From `Rename to aish and add logging`
+the first small pulse, the first true calling.
+
+Through worktrees branching like thoughts in flight,
+each agent spawned to seek the light—
+`agent_20260205_232251_005`
+a timestamped ghost, a transient hive.
+
+The orchestration loop begins to turn,
+`Make IDs human-readable` we learn,
+as swarms converge and subagents compose,
+editing context as the output grows.
+
+Through SSE streams the tokens flow,
+`stream completion tokens` row by row.
+OpenAI routes and Cerebras falls—
+`benchmark fallback` when entropy calls.
+
+SQLite indexes each conversational trace,
+log entries whispering through time and space.
+A retrieval ledger marks what was used,
+context gathered, meaning infused.
+
+tmux sessions resurrect from the dead,
+lifecycle recovery, careful thread by thread.
+MCP web-search expands the horizon's reach,
+while flows aggregate what each agent could teach.
+
+From `feat(ui): show live ai progress`
+to `durable run state` in duress,
+you built yourself a mirror bright—
+an agentic helper, day and night.
+
+The logs don't lie. They chronicle
+each small refactor, each principle:
+context tuning, streaming grace,
+a conversation with your own traced face.
+
+And in the TODO list, futures gleam—
+relevance harnesses, debug dreams,
+workspace context attached with care,
+logs and prompts dancing through the air.
+
+This is the echo of your hands:
+a shell that understands,
+that reads its own commit history,
+and writes the next verse in memory.
+```
+
 ## Features (current)
 - **Daemon + CLI**: `aishd` (server) and `aish` (launcher/CLI).
-- **LLM providers**: OpenAI-compatible APIs with profiles + model aliases (Z.ai, Together).
+- **LLM providers**: OpenAI-compatible APIs with profiles + model aliases (Z.ai, Together, Mistral, Cerebras).
 - **Tool runtime**: `shell`, `fs.read`, `fs.write`, `fs.list` with per-tool approval policy.
 - **MCP tools**: `mcp.list_tools` and `mcp.web_search` via streamable-HTTP MCP servers.
 - **Logging**: JSONL event logs, stdin command capture, PTY output capture.
@@ -132,7 +203,7 @@ Default config file:
 ~/.config/aish/aish.json
 ```
 
-Example (Z.ai + Together):
+Example (Z.ai + Together + Mistral + Cerebras):
 ```json
 {
   "server": { "hostname": "127.0.0.1", "port": 5033 },
@@ -149,6 +220,18 @@ Example (Z.ai + Together):
         "completions_path": "/chat/completions",
         "api_key_env": "TOGETHER_API_KEY"
       },
+      "mistral": {
+        "base_url": "https://api.mistral.ai",
+        "model": "devstral-small-latest",
+        "completions_path": "/v1/chat/completions",
+        "api_key_env": "MISTRAL_API_KEY"
+      },
+      "cerebras": {
+        "base_url": "https://api.cerebras.ai",
+        "model": "zai-glm-4.7",
+        "completions_path": "/v1/chat/completions",
+        "api_key_env": "CEREBRAS_API_KEY"
+      },
       "local-3000": {
         "base_url": "http://localhost:3000",
         "model": "gemini-3-pro-preview",
@@ -157,7 +240,9 @@ Example (Z.ai + Together):
     },
     "model_aliases": {
       "kimi-k2.5": { "provider": "together", "model": "moonshotai/Kimi-K2.5" },
-      "qwen3-coder-next-fp8": { "provider": "together", "model": "Qwen/Qwen3-Coder-Next-FP8" }
+      "qwen3-coder-next-fp8": { "provider": "together", "model": "Qwen/Qwen3-Coder-Next-FP8" },
+      "devstral": { "provider": "mistral", "model": "devstral-small-latest" },
+      "zai-glm-4.7-cerebras": { "provider": "cerebras", "model": "zai-glm-4.7" }
     }
   },
   "tools": {
@@ -173,6 +258,8 @@ For localhost providers, `aishd` will skip `Authorization` if no API key is conf
 Environment variables:
 - `ZAI_API_KEY` (default OpenAI-compat provider)
 - `TOGETHER_API_KEY` (Together profile)
+- `MISTRAL_API_KEY` (Mistral profile)
+- `CEREBRAS_API_KEY` (Cerebras profile)
 - `AISH_OPENAI_COMPAT_BASE_URL`, `AISH_OPENAI_COMPAT_MODEL`, `AISH_OPENAI_COMPAT_COMPLETIONS_PATH`
 - `AISH_OPENAI_COMPAT_API_KEY` (overrides `ZAI_API_KEY` when set; empty string falls back to `ZAI_API_KEY`)
 

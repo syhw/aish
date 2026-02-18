@@ -1,7 +1,9 @@
 use aish_core::config::{self, Config};
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
+use serde::Deserialize;
 use serde_json::{json, Map, Value};
+use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::io::{BufRead, BufReader, IsTerminal, Write};
@@ -692,7 +694,204 @@ fn run_llm(
         bail!("prompt is empty");
     }
     let prompt = maybe_attach_workspace_context(&prompt);
+    let opts = CompletionOverrides {
+        provider,
+        model,
+        max_tokens,
+        temperature,
+        top_p,
+        stop,
+    };
+    let session_id = env::var("AISH_SESSION_ID")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
 
+    let _ = write_log_event_value(
+        cfg,
+        "llm.request".to_string(),
+        json!({
+            "prompt": prompt,
+            "model": opts.model.clone().map(Value::String).unwrap_or(Value::Null),
+            "provider": opts.provider.clone().map(Value::String).unwrap_or(Value::Null),
+            "agentic_inline": true,
+        }),
+        None,
+        None,
+        None,
+    );
+
+    match run_llm_inline_agentic(cfg, &prompt, &opts, session_id.as_deref()) {
+        Ok(out) => {
+            if !out.is_empty() && !out.ends_with('\n') {
+                println!();
+            }
+            let _ = write_log_event_value(
+                cfg,
+                "llm.response".to_string(),
+                json!({ "text": out }),
+                None,
+                None,
+                None,
+            );
+            return Ok(());
+        }
+        Err(err) => {
+            eprintln!("ai inline tool loop failed ({err}); falling back to single completion");
+        }
+    }
+
+    let out = run_llm_single_completion(cfg, &prompt, &opts, session_id.as_deref())?;
+    if !out.is_empty() && !out.ends_with('\n') {
+        println!();
+    }
+    let _ = write_log_event_value(
+        cfg,
+        "llm.response".to_string(),
+        json!({
+            "text": out,
+            "fallback": "single_completion",
+        }),
+        None,
+        None,
+        None,
+    );
+    Ok(())
+}
+
+#[derive(Clone)]
+struct CompletionOverrides {
+    provider: Option<String>,
+    model: Option<String>,
+    max_tokens: Option<u32>,
+    temperature: Option<f32>,
+    top_p: Option<f32>,
+    stop: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct InlineToolCall {
+    tool: String,
+    args: Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct InlineShellArgs {
+    cmd: String,
+    cwd: Option<String>,
+    env: Option<BTreeMap<String, String>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct InlineFsReadArgs {
+    path: String,
+    max_bytes: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct InlineFsWriteArgs {
+    path: String,
+    content: String,
+    append: Option<bool>,
+    create_dirs: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct InlineFsListArgs {
+    path: String,
+}
+
+#[derive(Debug, Clone)]
+struct InlineToolState {
+    cwd: PathBuf,
+}
+
+fn run_llm_inline_agentic(
+    cfg: &Config,
+    prompt: &str,
+    opts: &CompletionOverrides,
+    session_id: Option<&str>,
+) -> Result<String> {
+    if env_flag_enabled("AISH_NO_AGENTIC") {
+        bail!("agentic mode disabled by AISH_NO_AGENTIC");
+    }
+
+    let base_url = format!("http://{}:{}", cfg.server.hostname, cfg.server.port);
+    let url = format!("{base_url}/v1/completions");
+    let cwd = env::current_dir().context("failed to resolve cwd")?;
+    let commands = detect_installed_commands();
+    let mut state = InlineToolState { cwd };
+    let max_steps = inline_max_steps();
+    let mut progress = ProgressLine::new(std::io::stderr().is_terminal() && ai_progress_enabled());
+    let mut messages = vec![
+        json!({
+            "role": "system",
+            "content": inline_agent_system_prompt(&state.cwd, &commands),
+        }),
+        json!({
+            "role": "user",
+            "content": prompt,
+        }),
+    ];
+
+    let mut final_output = String::new();
+    for step in 1..=max_steps {
+        progress.set_status(&format!("Planning next step ({step}/{max_steps})..."));
+        let body =
+            build_chat_completion_body(&messages, opts, if step == 1 { session_id } else { None });
+        let response = call_completion_json(&url, &body)?;
+        let assistant = extract_completion_text(&response)
+            .or_else(|| {
+                response
+                    .get("raw")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| response.to_string());
+        let tool_calls = parse_inline_tool_calls(&assistant);
+        messages.push(json!({
+            "role": "assistant",
+            "content": assistant,
+        }));
+
+        if tool_calls.is_empty() {
+            progress.stop();
+            print!("{}", assistant);
+            std::io::stdout().flush()?;
+            final_output = assistant;
+            break;
+        }
+
+        for call in tool_calls {
+            progress.set_status(&format!("Running {}", call.tool));
+            let result = execute_inline_tool(&base_url, &call, &mut state, session_id);
+            let rendered = match result {
+                Ok(value) => value,
+                Err(err) => json!({
+                    "success": false,
+                    "error": err.to_string(),
+                }),
+            };
+            messages.push(json!({
+                "role": "user",
+                "content": format!("Tool result for {}:\n{}", call.tool, rendered),
+            }));
+        }
+    }
+
+    progress.stop();
+    if final_output.is_empty() {
+        bail!("max agentic steps reached without final answer");
+    }
+    Ok(final_output)
+}
+
+fn run_llm_single_completion(
+    cfg: &Config,
+    prompt: &str,
+    opts: &CompletionOverrides,
+    session_id: Option<&str>,
+) -> Result<String> {
     let base_url = format!("http://{}:{}", cfg.server.hostname, cfg.server.port);
     let url = format!("{base_url}/v1/completions");
     let stream_url = format!("{base_url}/v1/completions/stream");
@@ -700,59 +899,33 @@ fn run_llm(
     let mut body = json!({
         "prompt": prompt,
     });
-    if let Ok(session_id) = env::var("AISH_SESSION_ID") {
-        if !session_id.trim().is_empty() {
-            body["session_id"] = json!(session_id);
-            body["context_mode"] = json!("diagnostic");
-        }
+    if let Some(session_id) = session_id {
+        body["session_id"] = json!(session_id);
+        body["context_mode"] = json!("diagnostic");
     }
-    if let Some(provider) = provider.clone() {
+    if let Some(provider) = opts.provider.clone() {
         body["provider"] = json!(provider);
     }
-    if let Some(model) = model.clone() {
+    if let Some(model) = opts.model.clone() {
         body["model"] = json!(model);
     }
-    if let Some(max_tokens) = max_tokens {
+    if let Some(max_tokens) = opts.max_tokens {
         body["max_tokens"] = json!(max_tokens);
     }
-    if let Some(temperature) = temperature {
+    if let Some(temperature) = opts.temperature {
         body["temperature"] = json!(temperature);
     }
-    if let Some(top_p) = top_p {
+    if let Some(top_p) = opts.top_p {
         body["top_p"] = json!(top_p);
     }
-    if !stop.is_empty() {
-        body["stop"] = json!(stop);
+    if !opts.stop.is_empty() {
+        body["stop"] = json!(opts.stop);
     }
-
-    let _ = write_log_event_value(
-        cfg,
-        "llm.request".to_string(),
-        json!({
-            "prompt": body["prompt"],
-            "model": body.get("model").cloned().unwrap_or(Value::Null),
-            "provider": body.get("provider").cloned().unwrap_or(Value::Null),
-        }),
-        None,
-        None,
-        None,
-    );
 
     let mut stream_body = body.clone();
     stream_body["stream"] = json!(true);
     if let Ok(out) = stream_completion_response(&stream_url, &stream_body) {
-        if !out.is_empty() && !out.ends_with('\n') {
-            println!();
-        }
-        let _ = write_log_event_value(
-            cfg,
-            "llm.response".to_string(),
-            json!({ "text": out }),
-            None,
-            None,
-            None,
-        );
-        return Ok(());
+        return Ok(out);
     }
 
     let agent = ureq::AgentBuilder::new()
@@ -766,21 +939,458 @@ fn run_llm(
 
     let text = resp.into_string().unwrap_or_default();
     let value: Value = serde_json::from_str(&text).unwrap_or_else(|_| json!({ "raw": text }));
-
     if let Some(out) = extract_completion_text(&value) {
-        println!("{out}");
-        let _ = write_log_event_value(
-            cfg,
-            "llm.response".to_string(),
-            json!({ "text": out }),
-            None,
-            None,
-            None,
-        );
-    } else {
-        println!("{}", serde_json::to_string_pretty(&value).unwrap_or(text));
+        print!("{out}");
+        std::io::stdout().flush()?;
+        return Ok(out);
     }
-    Ok(())
+    let pretty = serde_json::to_string_pretty(&value).unwrap_or(text);
+    print!("{pretty}");
+    std::io::stdout().flush()?;
+    Ok(pretty)
+}
+
+fn call_completion_json(url: &str, body: &Value) -> Result<Value> {
+    let agent = ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(120))
+        .build();
+    match agent
+        .post(url)
+        .set("Content-Type", "application/json")
+        .send_string(&body.to_string())
+    {
+        Ok(resp) => {
+            let text = resp.into_string().unwrap_or_default();
+            Ok(serde_json::from_str(&text).unwrap_or_else(|_| json!({ "raw": text })))
+        }
+        Err(ureq::Error::Status(status, resp)) => {
+            let text = resp.into_string().unwrap_or_default();
+            let parsed: Value =
+                serde_json::from_str(&text).unwrap_or_else(|_| json!({ "raw": text }));
+            Err(anyhow!(
+                "completion request failed with status {status}: {}",
+                parsed
+            ))
+        }
+        Err(err) => Err(anyhow!("failed to call aishd /v1/completions: {err}")),
+    }
+}
+
+fn build_chat_completion_body(
+    messages: &[Value],
+    opts: &CompletionOverrides,
+    session_id: Option<&str>,
+) -> Value {
+    let mut body = json!({
+        "messages": messages,
+    });
+    if let Some(session_id) = session_id {
+        body["session_id"] = json!(session_id);
+        body["context_mode"] = json!("diagnostic");
+    }
+    if let Some(provider) = opts.provider.clone() {
+        body["provider"] = json!(provider);
+    }
+    if let Some(model) = opts.model.clone() {
+        body["model"] = json!(model);
+    }
+    if let Some(max_tokens) = opts.max_tokens {
+        body["max_tokens"] = json!(max_tokens);
+    }
+    if let Some(temperature) = opts.temperature {
+        body["temperature"] = json!(temperature);
+    }
+    if let Some(top_p) = opts.top_p {
+        body["top_p"] = json!(top_p);
+    }
+    if !opts.stop.is_empty() {
+        body["stop"] = json!(opts.stop);
+    }
+    body
+}
+
+fn inline_agent_system_prompt(cwd: &Path, commands: &[String]) -> String {
+    let command_list = if commands.is_empty() {
+        "<none detected>".to_string()
+    } else {
+        commands.join(", ")
+    };
+    [
+        "You are `ai`, an agentic coding assistant running on the local machine.",
+        "You have direct tool access. Do not claim filesystem/shell access is unavailable.",
+        "",
+        "Preferred strategy:",
+        "- Use `shell` for search/build/test/run workflows (rg, git, python3, cargo, etc.).",
+        "- Use `fs.read` / `fs.write` / `fs.list` for precise file operations.",
+        "- Handle failures by inspecting stderr and iterating.",
+        "",
+        "Execution model:",
+        "- The shell tool runs non-interactive commands.",
+        "- Default shell cwd is carried between tool calls. Current cwd:",
+        &format!("  {}", cwd.display()),
+        "- Installed command hints:",
+        &format!("  {}", command_list),
+        "",
+        "Response contract:",
+        "- If another tool action is needed, respond with ONLY valid JSON.",
+        "- JSON formats:",
+        "  {\"tool\":\"shell\",\"args\":{\"cmd\":\"rg -n \\\"foo\\\" .\"}}",
+        "  {\"tool_calls\":[{\"tool\":\"fs.read\",\"args\":{\"path\":\"README.md\"}}]}",
+        "- If task is complete, provide a normal final answer for the user (not JSON).",
+        "",
+        "Tool args:",
+        "- shell: {\"cmd\":\"...\",\"cwd\":\"optional\",\"env\":{\"K\":\"V\"}}",
+        "- fs.read: {\"path\":\"...\",\"max_bytes\":optional}",
+        "- fs.write: {\"path\":\"...\",\"content\":\"...\",\"append\":false,\"create_dirs\":true}",
+        "- fs.list: {\"path\":\"...\"}",
+        "- mcp.list_tools / mcp.web_search are also available through the daemon.",
+    ]
+    .join("\n")
+}
+
+fn parse_inline_tool_calls(text: &str) -> Vec<InlineToolCall> {
+    let json = match extract_json_value(text) {
+        Some(value) => value,
+        None => return Vec::new(),
+    };
+    inline_tool_calls_from_value(&json)
+}
+
+fn inline_tool_calls_from_value(value: &Value) -> Vec<InlineToolCall> {
+    if let Some(obj) = value.as_object() {
+        if let Some(tool) = obj.get("tool").and_then(|v| v.as_str()) {
+            let args = obj.get("args").cloned().unwrap_or(Value::Null);
+            return vec![InlineToolCall {
+                tool: tool.to_string(),
+                args,
+            }];
+        }
+        if let Some(calls) = obj.get("tool_calls").and_then(|v| v.as_array()) {
+            return calls
+                .iter()
+                .filter_map(|item| {
+                    let tool = item.get("tool").or_else(|| item.get("name"))?.as_str()?;
+                    let args = item.get("args").cloned().unwrap_or(Value::Null);
+                    Some(InlineToolCall {
+                        tool: tool.to_string(),
+                        args,
+                    })
+                })
+                .collect();
+        }
+    }
+    if let Some(arr) = value.as_array() {
+        return arr
+            .iter()
+            .filter_map(|item| {
+                let tool = item.get("tool").or_else(|| item.get("name"))?.as_str()?;
+                let args = item.get("args").cloned().unwrap_or(Value::Null);
+                Some(InlineToolCall {
+                    tool: tool.to_string(),
+                    args,
+                })
+            })
+            .collect();
+    }
+    Vec::new()
+}
+
+fn extract_json_value(text: &str) -> Option<Value> {
+    let trimmed = text.trim();
+    if trimmed.starts_with("```") {
+        if let Some(start) = trimmed.find("```") {
+            if let Some(end) = trimmed.rfind("```") {
+                if end > start + 3 {
+                    let inner = &trimmed[start + 3..end];
+                    let inner = inner.trim_start_matches("json").trim();
+                    return serde_json::from_str(inner).ok();
+                }
+            }
+        }
+    }
+    if trimmed.starts_with('{') || trimmed.starts_with('[') {
+        serde_json::from_str(trimmed).ok()
+    } else {
+        None
+    }
+}
+
+fn execute_inline_tool(
+    base_url: &str,
+    call: &InlineToolCall,
+    state: &mut InlineToolState,
+    session_id: Option<&str>,
+) -> Result<Value> {
+    match call.tool.as_str() {
+        "shell" => run_inline_shell(call.args.clone(), state),
+        "fs.read" => run_inline_fs_read(call.args.clone(), state),
+        "fs.write" => run_inline_fs_write(call.args.clone(), state),
+        "fs.list" => run_inline_fs_list(call.args.clone(), state),
+        "mcp.list_tools" | "mcp.web_search" => {
+            call_daemon_tool(base_url, &call.tool, call.args.clone(), session_id)
+        }
+        other => Err(anyhow!("unknown tool `{other}`")),
+    }
+}
+
+fn run_inline_shell(args: Value, state: &mut InlineToolState) -> Result<Value> {
+    let args: InlineShellArgs = serde_json::from_value(args)
+        .with_context(|| "invalid shell args (expected cmd/cwd/env)")?;
+    let cmd_text = args.cmd.trim();
+    if cmd_text.is_empty() {
+        bail!("shell cmd is empty");
+    }
+
+    if let Some(next_cwd) = parse_simple_cd(cmd_text, &state.cwd) {
+        state.cwd = next_cwd;
+        return Ok(json!({
+            "status": 0,
+            "success": true,
+            "stdout": "",
+            "stderr": "",
+            "cwd": state.cwd.display().to_string(),
+            "note": "cwd updated via cd",
+        }));
+    }
+
+    let cwd = args
+        .cwd
+        .map(|value| resolve_tool_path(&state.cwd, &value))
+        .unwrap_or_else(|| state.cwd.clone());
+    if !cwd.exists() {
+        bail!("shell cwd does not exist: {}", cwd.display());
+    }
+    if !cwd.is_dir() {
+        bail!("shell cwd is not a directory: {}", cwd.display());
+    }
+    state.cwd = cwd.clone();
+
+    let (shell, shell_args) = select_inline_shell();
+    let mut cmd = Command::new(shell);
+    cmd.args(shell_args);
+    cmd.arg(cmd_text);
+    cmd.current_dir(&state.cwd);
+    if let Some(envs) = args.env {
+        cmd.envs(envs);
+    }
+    let output = cmd.output().context("failed to run shell command")?;
+    Ok(json!({
+        "status": output.status.code(),
+        "success": output.status.success(),
+        "stdout": String::from_utf8_lossy(&output.stdout),
+        "stderr": String::from_utf8_lossy(&output.stderr),
+        "cwd": state.cwd.display().to_string(),
+    }))
+}
+
+fn run_inline_fs_read(args: Value, state: &InlineToolState) -> Result<Value> {
+    let args: InlineFsReadArgs =
+        serde_json::from_value(args).with_context(|| "invalid fs.read args (expected path)")?;
+    let path = resolve_tool_path(&state.cwd, &args.path);
+    let bytes = fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
+    let max_bytes = args.max_bytes.unwrap_or(256_000).clamp(1, 2_000_000) as usize;
+    let mut data = bytes;
+    let truncated = data.len() > max_bytes;
+    if truncated {
+        data.truncate(max_bytes);
+    }
+    Ok(json!({
+        "path": path.display().to_string(),
+        "truncated": truncated,
+        "content": String::from_utf8_lossy(&data),
+    }))
+}
+
+fn run_inline_fs_write(args: Value, state: &InlineToolState) -> Result<Value> {
+    let args: InlineFsWriteArgs = serde_json::from_value(args)
+        .with_context(|| "invalid fs.write args (expected path/content)")?;
+    let path = resolve_tool_path(&state.cwd, &args.path);
+    if args.create_dirs.unwrap_or(false) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).with_context(|| {
+                format!("failed to create parent directories for {}", path.display())
+            })?;
+        }
+    }
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create(true);
+    if args.append.unwrap_or(false) {
+        opts.append(true);
+    } else {
+        opts.truncate(true);
+    }
+    let mut file = opts
+        .open(&path)
+        .with_context(|| format!("failed to open {}", path.display()))?;
+    use std::io::Write as _;
+    file.write_all(args.content.as_bytes())
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(json!({
+        "path": path.display().to_string(),
+        "bytes_written": args.content.len(),
+        "appended": args.append.unwrap_or(false),
+    }))
+}
+
+fn run_inline_fs_list(args: Value, state: &InlineToolState) -> Result<Value> {
+    let args: InlineFsListArgs =
+        serde_json::from_value(args).with_context(|| "invalid fs.list args (expected path)")?;
+    let path = resolve_tool_path(&state.cwd, &args.path);
+    let mut entries = Vec::new();
+    for entry in fs::read_dir(&path)
+        .with_context(|| format!("failed to list {}", path.display()))?
+        .flatten()
+    {
+        let mut name = entry.file_name().to_string_lossy().to_string();
+        if entry.path().is_dir() {
+            name.push('/');
+        }
+        entries.push(name);
+    }
+    entries.sort();
+    Ok(json!({
+        "path": path.display().to_string(),
+        "entries": entries,
+    }))
+}
+
+fn call_daemon_tool(
+    base_url: &str,
+    name: &str,
+    args: Value,
+    session_id: Option<&str>,
+) -> Result<Value> {
+    let url = format!("{base_url}/v1/tools/{name}/call");
+    let mut body = json!({
+        "args": args,
+        "approved": true,
+        "approval_reason": "inline ai tool loop",
+    });
+    if let Some(session_id) = session_id {
+        body["session_id"] = json!(session_id);
+    }
+    let agent = ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(60))
+        .build();
+    match agent
+        .post(&url)
+        .set("Content-Type", "application/json")
+        .send_string(&body.to_string())
+    {
+        Ok(resp) => {
+            let text = resp.into_string().unwrap_or_default();
+            let value: Value =
+                serde_json::from_str(&text).unwrap_or_else(|_| json!({ "raw": text }));
+            Ok(value.get("result").cloned().unwrap_or(value))
+        }
+        Err(ureq::Error::Status(status, resp)) => {
+            let text = resp.into_string().unwrap_or_default();
+            let parsed: Value =
+                serde_json::from_str(&text).unwrap_or_else(|_| json!({ "raw": text }));
+            Err(anyhow!("daemon tool call failed ({status}): {}", parsed))
+        }
+        Err(err) => Err(anyhow!("daemon tool call error: {err}")),
+    }
+}
+
+fn resolve_tool_path(base: &Path, input: &str) -> PathBuf {
+    let path = PathBuf::from(input);
+    if path.is_absolute() {
+        path
+    } else {
+        base.join(path)
+    }
+}
+
+fn parse_simple_cd(cmd: &str, cwd: &Path) -> Option<PathBuf> {
+    let trimmed = cmd.trim();
+    if trimmed == "cd" {
+        return env::var("HOME").ok().map(PathBuf::from);
+    }
+    let rest = trimmed.strip_prefix("cd ")?;
+    if rest.contains("&&")
+        || rest.contains("||")
+        || rest.contains(';')
+        || rest.contains('|')
+        || rest.contains('\n')
+        || rest.contains('\t')
+    {
+        return None;
+    }
+    let target = rest.trim().trim_matches('"').trim_matches('\'');
+    if target.is_empty() {
+        return None;
+    }
+    let resolved = if target == "~" {
+        env::var("HOME").ok().map(PathBuf::from)?
+    } else if let Some(suffix) = target.strip_prefix("~/") {
+        PathBuf::from(env::var("HOME").ok()?).join(suffix)
+    } else {
+        resolve_tool_path(cwd, target)
+    };
+    if resolved.is_dir() {
+        Some(resolved)
+    } else {
+        None
+    }
+}
+
+fn select_inline_shell() -> (String, Vec<String>) {
+    let shell = env::var("SHELL").unwrap_or_else(|_| "sh".to_string());
+    let shell_lower = shell.to_lowercase();
+    if shell_lower.contains("zsh") {
+        return (shell, vec!["-f".to_string(), "-c".to_string()]);
+    }
+    if shell_lower.contains("bash") {
+        return (
+            shell,
+            vec![
+                "--noprofile".to_string(),
+                "--norc".to_string(),
+                "-c".to_string(),
+            ],
+        );
+    }
+    (shell, vec!["-c".to_string()])
+}
+
+fn inline_max_steps() -> u32 {
+    env::var("AISH_INLINE_MAX_STEPS")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .map(|value| value.clamp(1, 40))
+        .unwrap_or(10)
+}
+
+fn env_flag_enabled(name: &str) -> bool {
+    env::var(name)
+        .ok()
+        .map(|value| {
+            let value = value.trim().to_ascii_lowercase();
+            matches!(value.as_str(), "1" | "true" | "yes" | "on")
+        })
+        .unwrap_or(false)
+}
+
+fn detect_installed_commands() -> Vec<String> {
+    let candidates = [
+        "rg", "fd", "git", "python3", "cargo", "rustc", "uv", "pytest", "node", "npm", "pnpm",
+        "go", "make", "just", "docker", "tmux", "jq", "curl", "sed", "awk",
+    ];
+    candidates
+        .iter()
+        .filter(|name| command_exists(name))
+        .map(|name| (*name).to_string())
+        .collect()
+}
+
+fn command_exists(name: &str) -> bool {
+    Command::new("sh")
+        .arg("-c")
+        .arg(format!("command -v {} >/dev/null 2>&1", name))
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
 }
 
 fn maybe_attach_workspace_context(prompt: &str) -> String {
@@ -936,6 +1546,7 @@ fn indented_block(text: &str) -> String {
 }
 
 enum StreamChannelMessage {
+    Connected,
     Event {
         event_type: Option<String>,
         data: String,
@@ -948,6 +1559,7 @@ struct ProgressLine {
     current_status: String,
     started_at: Instant,
     last_rendered_at: Instant,
+    spinner_idx: usize,
 }
 
 impl ProgressLine {
@@ -955,9 +1567,10 @@ impl ProgressLine {
         let now = Instant::now();
         Self {
             enabled,
-            current_status: "Preparing request...".to_string(),
+            current_status: "Packing context...".to_string(),
             started_at: now,
-            last_rendered_at: now.checked_sub(Duration::from_secs(3)).unwrap_or(now),
+            last_rendered_at: now.checked_sub(Duration::from_millis(120)).unwrap_or(now),
+            spinner_idx: 0,
         }
     }
 
@@ -991,18 +1604,24 @@ impl ProgressLine {
             return;
         }
         let now = Instant::now();
-        if !force && now.duration_since(self.last_rendered_at) < Duration::from_secs(3) {
+        if !force && now.duration_since(self.last_rendered_at) < Duration::from_millis(120) {
             return;
         }
+        let spinner = ["|", "/", "-", "\\"];
+        let frame = spinner[self.spinner_idx % spinner.len()];
+        self.spinner_idx = self.spinner_idx.wrapping_add(1);
         let elapsed = now.duration_since(self.started_at).as_secs();
-        eprint!("\r\x1b[2K[ai] {} ({}s)", self.current_status, elapsed);
+        eprint!(
+            "\r\x1b[2K[ai] {} {} ({}s)",
+            frame, self.current_status, elapsed
+        );
         let _ = std::io::stderr().flush();
         self.last_rendered_at = now;
     }
 }
 
 fn stream_completion_response(url: &str, body: &Value) -> Result<String> {
-    let mut progress = ProgressLine::new(std::io::stderr().is_terminal());
+    let mut progress = ProgressLine::new(std::io::stderr().is_terminal() && ai_progress_enabled());
     progress.render(true);
     let (tx, rx) = mpsc::channel::<StreamChannelMessage>();
     let request_url = url.to_string();
@@ -1013,7 +1632,10 @@ fn stream_completion_response(url: &str, body: &Value) -> Result<String> {
     let mut done = false;
 
     loop {
-        match rx.recv_timeout(Duration::from_secs(3)) {
+        match rx.recv_timeout(Duration::from_millis(120)) {
+            Ok(StreamChannelMessage::Connected) => {
+                progress.set_status("Waiting for first token from provider...");
+            }
             Ok(StreamChannelMessage::Event { event_type, data }) => {
                 if handle_sse_event(event_type.as_deref(), &data, &mut full_text, &mut progress)? {
                     done = true;
@@ -1042,6 +1664,16 @@ fn stream_completion_response(url: &str, body: &Value) -> Result<String> {
     Ok(full_text)
 }
 
+fn ai_progress_enabled() -> bool {
+    match env::var("AISH_UI_PROGRESS") {
+        Ok(value) => matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        Err(_) => false,
+    }
+}
+
 fn stream_completion_worker(url: &str, body: &str, tx: Sender<StreamChannelMessage>) -> Result<()> {
     let agent = ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(300))
@@ -1052,6 +1684,7 @@ fn stream_completion_worker(url: &str, body: &str, tx: Sender<StreamChannelMessa
         .set("Accept", "text/event-stream")
         .send_string(body)
         .with_context(|| "failed to call aishd /v1/completions/stream")?;
+    let _ = tx.send(StreamChannelMessage::Connected);
 
     let mut reader = BufReader::new(resp.into_reader());
     let mut line = String::new();
@@ -1230,8 +1863,10 @@ fn read_last_event(path: &Path) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::{
-        handle_sse_event, normalize_cli_args, should_attach_workspace_context, ProgressLine,
+        handle_sse_event, inline_agent_system_prompt, normalize_cli_args, parse_inline_tool_calls,
+        parse_simple_cd, should_attach_workspace_context, ProgressLine,
     };
+    use std::path::Path;
 
     #[test]
     fn normalize_cli_args_inserts_llm_for_prompt() {
@@ -1330,5 +1965,43 @@ mod tests {
     #[test]
     fn should_attach_workspace_context_ignores_general_prompts() {
         assert!(!should_attach_workspace_context("Count to 5 slowly."));
+    }
+
+    #[test]
+    fn inline_agent_system_prompt_includes_command_hints() {
+        let prompt = inline_agent_system_prompt(
+            Path::new("/tmp/work"),
+            &["rg".to_string(), "git".to_string()],
+        );
+        assert!(prompt.contains("fs.write"));
+        assert!(prompt.contains("rg, git"));
+        assert!(prompt.contains("/tmp/work"));
+    }
+
+    #[test]
+    fn parse_inline_tool_calls_handles_single_and_array() {
+        let single = parse_inline_tool_calls(r#"{"tool":"shell","args":{"cmd":"ls"}}"#);
+        assert_eq!(single.len(), 1);
+        assert_eq!(single[0].tool, "shell");
+
+        let array = parse_inline_tool_calls(
+            r#"{"tool_calls":[{"tool":"fs.read","args":{"path":"README.md"}}]}"#,
+        );
+        assert_eq!(array.len(), 1);
+        assert_eq!(array[0].tool, "fs.read");
+    }
+
+    #[test]
+    fn parse_simple_cd_supports_home_and_relative() {
+        let root = std::env::temp_dir().join(format!("aish_test_cd_{}", std::process::id()));
+        let repo = root.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let cwd = root.as_path();
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+        let target_home = parse_simple_cd("cd", cwd).unwrap();
+        assert_eq!(target_home, Path::new(&home));
+        assert_eq!(parse_simple_cd("cd repo", cwd).unwrap(), repo.as_path());
+        assert!(parse_simple_cd("cd a && ls", cwd).is_none());
+        std::fs::remove_dir_all(&root).ok();
     }
 }

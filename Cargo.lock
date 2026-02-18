@@ -27,6 +27,7 @@ dependencies = [
  "aish_core",
  "anyhow",
  "clap",
+ "serde",
  "serde_json",
  "tracing",
  "tracing-subscriber",

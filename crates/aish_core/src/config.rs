@@ -350,7 +350,11 @@ mod tests {
         assert_eq!(server.transport_type, "streamable-http");
         assert_eq!(server.url, "https://example.invalid/mcp");
         assert_eq!(
-            server.headers.get("Authorization").cloned().unwrap_or_default(),
+            server
+                .headers
+                .get("Authorization")
+                .cloned()
+                .unwrap_or_default(),
             "Bearer your_api_key"
         );
     }

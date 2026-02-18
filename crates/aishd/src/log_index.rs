@@ -1660,7 +1660,9 @@ fn apply_retriever_ranking(
     query_tokens: &[String],
     options: BuildContextOptions,
 ) -> Vec<ScoredCandidate> {
-    if candidates.is_empty() || query_tokens.is_empty() || options.retriever == RetrievalStrategy::Lexical
+    if candidates.is_empty()
+        || query_tokens.is_empty()
+        || options.retriever == RetrievalStrategy::Lexical
     {
         return candidates;
     }
@@ -3202,13 +3204,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(bm25_bundle.retriever, "bm25");
-        assert!(
-            bm25_bundle
-                .selected_evidence
-                .iter()
-                .flat_map(|item| item.reasons.iter())
-                .any(|reason| reason.contains("bm25"))
-        );
+        assert!(bm25_bundle
+            .selected_evidence
+            .iter()
+            .flat_map(|item| item.reasons.iter())
+            .any(|reason| reason.contains("bm25")));
 
         let hybrid_bundle = build_relevant_context_bundle_with_options(
             &db_path,
@@ -3221,13 +3221,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(hybrid_bundle.retriever, "hybrid");
-        assert!(
-            hybrid_bundle
-                .selected_evidence
-                .iter()
-                .flat_map(|item| item.reasons.iter())
-                .any(|reason| reason.contains("hybrid"))
-        );
+        assert!(hybrid_bundle
+            .selected_evidence
+            .iter()
+            .flat_map(|item| item.reasons.iter())
+            .any(|reason| reason.contains("hybrid")));
 
         let _ = fs::remove_dir_all(root);
     }
