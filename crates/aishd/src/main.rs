@@ -2535,25 +2535,22 @@ fn call_openai_compat_completions(
     model: &str,
     req: &CompletionRequest,
 ) -> Result<Value, (u16, Value)> {
-    let url = if provider.completions_path.starts_with("http://")
-        || provider.completions_path.starts_with("https://")
-    {
-        provider.completions_path.clone()
+    let uses_openai_responses = is_openai_responses_provider(provider, model);
+    let endpoint_path = effective_provider_path(provider, uses_openai_responses);
+    let url = build_provider_url(provider, &endpoint_path);
+    let is_anthropic = is_anthropic_messages_provider(provider);
+    let endpoint_path_lower = endpoint_path.to_ascii_lowercase();
+    let is_chat = !uses_openai_responses
+        && (endpoint_path_lower.contains("chat/completions")
+            || endpoint_path_lower.ends_with("/messages"));
+    let mut body = if uses_openai_responses {
+        build_openai_responses_body(req, model, req.stream == Some(true))?
     } else {
-        let base = provider.base_url.trim_end_matches('/');
-        let path = if provider.completions_path.starts_with('/') {
-            provider.completions_path.clone()
-        } else {
-            format!("/{}", provider.completions_path)
-        };
-        format!("{base}{path}")
+        json!({
+            "model": model,
+        })
     };
-
-    let is_chat = provider.completions_path.contains("chat/completions");
-    let mut body = json!({
-        "model": model,
-    });
-    if is_chat {
+    if !uses_openai_responses && is_chat {
         let messages = if let Some(messages) = &req.messages {
             messages.clone()
         } else if let Some(prompt) = req.prompt.as_deref() {
@@ -2568,26 +2565,31 @@ fn call_openai_compat_completions(
             return Err((400, json!({"error": "prompt or messages required"})));
         };
         body["messages"] = json!(messages);
-    } else {
-        let prompt = req.prompt.as_deref().unwrap_or_default();
+    } else if !uses_openai_responses {
+        let prompt = request_prompt_text(req);
         if prompt.trim().is_empty() {
             return Err((400, json!({"error": "prompt is required"})));
         }
         body["prompt"] = json!(prompt);
     }
-    if let Some(max_tokens) = req.max_tokens {
-        body["max_tokens"] = json!(max_tokens);
+    if !uses_openai_responses {
+        if let Some(max_tokens) = req.max_tokens {
+            body["max_tokens"] = json!(max_tokens);
+        } else if is_anthropic {
+            // Anthropic messages API requires max_tokens.
+            body["max_tokens"] = json!(1024);
+        }
+        if let Some(temperature) = req.temperature {
+            body["temperature"] = json!(temperature);
+        }
+        if let Some(top_p) = req.top_p {
+            body["top_p"] = json!(top_p);
+        }
+        if let Some(stop) = &req.stop {
+            body["stop"] = json!(stop);
+        }
     }
-    if let Some(temperature) = req.temperature {
-        body["temperature"] = json!(temperature);
-    }
-    if let Some(top_p) = req.top_p {
-        body["top_p"] = json!(top_p);
-    }
-    if let Some(stop) = &req.stop {
-        body["stop"] = json!(stop);
-    }
-    if req.stream == Some(true) {
+    if !uses_openai_responses && req.stream == Some(true) {
         body["stream"] = json!(true);
     }
 
@@ -2596,7 +2598,13 @@ fn call_openai_compat_completions(
         .build();
     let mut http = agent.post(&url).set("Content-Type", "application/json");
     if !api_key.trim().is_empty() {
-        http = http.set("Authorization", &format!("Bearer {}", api_key));
+        if is_anthropic {
+            http = http
+                .set("x-api-key", api_key)
+                .set("anthropic-version", "2023-06-01");
+        } else {
+            http = http.set("Authorization", &format!("Bearer {}", api_key));
+        }
     }
     let response = http.send_string(&body.to_string());
 
@@ -2625,26 +2633,23 @@ fn call_openai_compat_completions_streaming<F>(
 where
     F: FnMut(String),
 {
-    let url = if provider.completions_path.starts_with("http://")
-        || provider.completions_path.starts_with("https://")
-    {
-        provider.completions_path.clone()
+    let uses_openai_responses = is_openai_responses_provider(provider, model);
+    let endpoint_path = effective_provider_path(provider, uses_openai_responses);
+    let url = build_provider_url(provider, &endpoint_path);
+    let is_anthropic = is_anthropic_messages_provider(provider);
+    let endpoint_path_lower = endpoint_path.to_ascii_lowercase();
+    let is_chat = !uses_openai_responses
+        && (endpoint_path_lower.contains("chat/completions")
+            || endpoint_path_lower.ends_with("/messages"));
+    let mut body = if uses_openai_responses {
+        build_openai_responses_body(req, model, true)?
     } else {
-        let base = provider.base_url.trim_end_matches('/');
-        let path = if provider.completions_path.starts_with('/') {
-            provider.completions_path.clone()
-        } else {
-            format!("/{}", provider.completions_path)
-        };
-        format!("{base}{path}")
+        json!({
+            "model": model,
+            "stream": true,
+        })
     };
-
-    let is_chat = provider.completions_path.contains("chat/completions");
-    let mut body = json!({
-        "model": model,
-        "stream": true,
-    });
-    if is_chat {
+    if !uses_openai_responses && is_chat {
         let messages = if let Some(messages) = &req.messages {
             messages.clone()
         } else if let Some(prompt) = req.prompt.as_deref() {
@@ -2659,24 +2664,29 @@ where
             return Err((400, json!({"error": "prompt or messages required"})));
         };
         body["messages"] = json!(messages);
-    } else {
-        let prompt = req.prompt.as_deref().unwrap_or_default();
+    } else if !uses_openai_responses {
+        let prompt = request_prompt_text(req);
         if prompt.trim().is_empty() {
             return Err((400, json!({"error": "prompt is required"})));
         }
         body["prompt"] = json!(prompt);
     }
-    if let Some(max_tokens) = req.max_tokens {
-        body["max_tokens"] = json!(max_tokens);
-    }
-    if let Some(temperature) = req.temperature {
-        body["temperature"] = json!(temperature);
-    }
-    if let Some(top_p) = req.top_p {
-        body["top_p"] = json!(top_p);
-    }
-    if let Some(stop) = &req.stop {
-        body["stop"] = json!(stop);
+    if !uses_openai_responses {
+        if let Some(max_tokens) = req.max_tokens {
+            body["max_tokens"] = json!(max_tokens);
+        } else if is_anthropic {
+            // Anthropic messages API requires max_tokens.
+            body["max_tokens"] = json!(1024);
+        }
+        if let Some(temperature) = req.temperature {
+            body["temperature"] = json!(temperature);
+        }
+        if let Some(top_p) = req.top_p {
+            body["top_p"] = json!(top_p);
+        }
+        if let Some(stop) = &req.stop {
+            body["stop"] = json!(stop);
+        }
     }
 
     let agent = ureq::AgentBuilder::new()
@@ -2687,7 +2697,13 @@ where
         .set("Content-Type", "application/json")
         .set("Accept", "text/event-stream");
     if !api_key.trim().is_empty() {
-        http = http.set("Authorization", &format!("Bearer {}", api_key));
+        if is_anthropic {
+            http = http
+                .set("x-api-key", api_key)
+                .set("anthropic-version", "2023-06-01");
+        } else {
+            http = http.set("Authorization", &format!("Bearer {}", api_key));
+        }
     }
     let response = http.send_string(&body.to_string());
 
@@ -2748,6 +2764,154 @@ where
         }
         Err(err) => Err((502, json!({ "error": err.to_string() }))),
     }
+}
+
+fn is_anthropic_messages_provider(provider: &OpenAICompatConfig) -> bool {
+    let base = provider.base_url.to_ascii_lowercase();
+    let path = provider.completions_path.to_ascii_lowercase();
+    base.contains("anthropic.com") || path.ends_with("/messages")
+}
+
+fn is_openai_responses_model(model: &str) -> bool {
+    let lowered = model.to_ascii_lowercase();
+    lowered.contains("codex") || lowered.starts_with("gpt-5")
+}
+
+fn is_openai_responses_provider(provider: &OpenAICompatConfig, model: &str) -> bool {
+    let path = provider.completions_path.to_ascii_lowercase();
+    if path.contains("/responses") {
+        return true;
+    }
+    let base = provider.base_url.to_ascii_lowercase();
+    base.contains("api.openai.com") && is_openai_responses_model(model)
+}
+
+fn effective_provider_path(provider: &OpenAICompatConfig, force_openai_responses: bool) -> String {
+    if force_openai_responses {
+        let configured = provider.completions_path.trim();
+        if configured.starts_with("http://") || configured.starts_with("https://") {
+            if configured.to_ascii_lowercase().contains("/responses") {
+                return configured.to_string();
+            }
+        }
+        return "/responses".to_string();
+    }
+
+    let configured = provider.completions_path.trim();
+    if configured.is_empty() {
+        "/completions".to_string()
+    } else {
+        configured.to_string()
+    }
+}
+
+fn build_provider_url(provider: &OpenAICompatConfig, endpoint_path: &str) -> String {
+    if endpoint_path.starts_with("http://") || endpoint_path.starts_with("https://") {
+        return endpoint_path.to_string();
+    }
+    let base = provider.base_url.trim_end_matches('/');
+    let path = if endpoint_path.starts_with('/') {
+        endpoint_path.to_string()
+    } else {
+        format!("/{}", endpoint_path)
+    };
+    format!("{base}{path}")
+}
+
+fn build_openai_responses_body(
+    req: &CompletionRequest,
+    model: &str,
+    stream: bool,
+) -> Result<Value, (u16, Value)> {
+    let mut body = json!({
+        "model": model,
+    });
+    if stream {
+        body["stream"] = json!(true);
+    }
+
+    let mut input_items: Vec<Value> = Vec::new();
+    let mut instructions: Vec<String> = Vec::new();
+    if let Some(messages) = &req.messages {
+        for msg in messages {
+            let content = msg.content.trim();
+            if content.is_empty() {
+                continue;
+            }
+            let role = msg.role.trim().to_ascii_lowercase();
+            if role == "system" {
+                instructions.push(content.to_string());
+                continue;
+            }
+            let role_value = if role.is_empty() {
+                "user".to_string()
+            } else {
+                role
+            };
+            input_items.push(json!({
+                "role": role_value,
+                "content": content,
+            }));
+        }
+    }
+
+    if !input_items.is_empty() {
+        body["input"] = json!(input_items);
+    } else {
+        let prompt = request_prompt_text(req);
+        if prompt.trim().is_empty() {
+            return Err((400, json!({"error": "prompt or messages required"})));
+        }
+        body["input"] = json!(prompt);
+    }
+
+    if !instructions.is_empty() {
+        body["instructions"] = json!(instructions.join("\n\n"));
+    }
+    if let Some(max_tokens) = req.max_tokens {
+        body["max_output_tokens"] = json!(max_tokens);
+    }
+    if let Some(temperature) = req.temperature {
+        body["temperature"] = json!(temperature);
+    }
+    if let Some(top_p) = req.top_p {
+        body["top_p"] = json!(top_p);
+    }
+    if let Some(stop) = &req.stop {
+        if !stop.is_empty() {
+            body["stop"] = json!(stop);
+        }
+    }
+
+    Ok(body)
+}
+
+fn request_prompt_text(req: &CompletionRequest) -> String {
+    if let Some(prompt) = req
+        .prompt
+        .as_ref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
+        return prompt.to_string();
+    }
+    if let Some(messages) = &req.messages {
+        let lines: Vec<String> = messages
+            .iter()
+            .filter_map(|msg| {
+                let content = msg.content.trim();
+                if content.is_empty() {
+                    None
+                } else {
+                    Some(content.to_string())
+                }
+            })
+            .collect();
+        if !lines.is_empty() {
+            return lines.join("\n\n");
+        }
+    }
+    String::new()
 }
 
 fn resolve_provider<'a>(
@@ -3335,31 +3499,156 @@ fn render_template(value: Value, outputs: &BTreeMap<String, Value>) -> Value {
 }
 
 fn extract_completion_text(value: &Value) -> Option<String> {
-    let choices = value.get("choices")?.as_array()?;
-    let first = choices.first()?;
-    if let Some(text) = first.get("text").and_then(|v| v.as_str()) {
-        return Some(text.to_string());
-    }
-    if let Some(message) = first.get("message") {
-        if let Some(content) = message.get("content").and_then(|v| v.as_str()) {
-            return Some(content.to_string());
+    if let Some(choices) = value.get("choices").and_then(|v| v.as_array()) {
+        if let Some(first) = choices.first() {
+            if let Some(text) = first.get("text").and_then(|v| v.as_str()) {
+                return Some(text.to_string());
+            }
+            if let Some(message) = first.get("message") {
+                if let Some(content) = message
+                    .get("content")
+                    .and_then(extract_text_value)
+                    .filter(|s| !s.is_empty())
+                {
+                    return Some(content);
+                }
+                if let Some(content) = extract_text_value(message).filter(|s| !s.is_empty()) {
+                    return Some(content);
+                }
+            }
         }
+    }
+    if let Some(content) = value
+        .get("content")
+        .and_then(extract_text_value)
+        .filter(|s| !s.is_empty())
+    {
+        return Some(content);
+    }
+    if let Some(output_text) = value
+        .get("output_text")
+        .and_then(extract_text_value)
+        .filter(|s| !s.is_empty())
+    {
+        return Some(output_text);
+    }
+    if let Some(delta_text) = value
+        .get("delta")
+        .and_then(extract_text_value)
+        .filter(|s| !s.is_empty())
+    {
+        return Some(delta_text);
+    }
+    if let Some(text) = value.get("text").and_then(|v| v.as_str()) {
+        if !text.is_empty() {
+            return Some(text.to_string());
+        }
+    }
+    if let Some(text) = extract_text_value(value).filter(|s| !s.is_empty()) {
+        return Some(text);
     }
     None
 }
 
 fn extract_completion_delta_text(value: &Value) -> Option<String> {
-    let choices = value.get("choices")?.as_array()?;
-    let first = choices.first()?;
-    if let Some(delta) = first.get("delta") {
-        if let Some(content) = delta.get("content").and_then(|v| v.as_str()) {
-            return Some(content.to_string());
+    if let Some(choices) = value.get("choices").and_then(|v| v.as_array()) {
+        if let Some(first) = choices.first() {
+            if let Some(delta) = first.get("delta") {
+                if let Some(content) = delta
+                    .get("content")
+                    .and_then(extract_text_value)
+                    .filter(|s| !s.is_empty())
+                {
+                    return Some(content);
+                }
+                if let Some(reasoning) = delta
+                    .get("reasoning_content")
+                    .and_then(extract_text_value)
+                    .filter(|s| !s.is_empty())
+                {
+                    return Some(reasoning);
+                }
+                if let Some(content) = extract_text_value(delta).filter(|s| !s.is_empty()) {
+                    return Some(content);
+                }
+            }
+            if let Some(text) = first.get("text").and_then(|v| v.as_str()) {
+                return Some(text.to_string());
+            }
         }
     }
-    if let Some(text) = first.get("text").and_then(|v| v.as_str()) {
-        return Some(text.to_string());
+    if let Some(delta) = value
+        .get("delta")
+        .and_then(extract_text_value)
+        .filter(|s| !s.is_empty())
+    {
+        return Some(delta);
+    }
+    if let Some(content) = value
+        .get("content")
+        .and_then(extract_text_value)
+        .filter(|s| !s.is_empty())
+    {
+        return Some(content);
+    }
+    if let Some(text) = value.get("text").and_then(|v| v.as_str()) {
+        if !text.is_empty() {
+            return Some(text.to_string());
+        }
     }
     None
+}
+
+fn extract_text_value(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => {
+            if text.is_empty() {
+                None
+            } else {
+                Some(text.clone())
+            }
+        }
+        Value::Array(items) => {
+            let mut out = String::new();
+            for item in items {
+                if let Some(text) = extract_text_value(item) {
+                    out.push_str(&text);
+                }
+            }
+            if out.is_empty() {
+                None
+            } else {
+                Some(out)
+            }
+        }
+        Value::Object(map) => {
+            for key in [
+                "content",
+                "text",
+                "output_text",
+                "completion",
+                "generated_text",
+                "answer",
+                "value",
+                "message",
+                "delta",
+                "reasoning_content",
+                "reasoning",
+                "output",
+                "response",
+            ] {
+                if let Some(v) = map.get(key) {
+                    if let Some(text) = extract_text_value(v) {
+                        if !text.is_empty() {
+                            return Some(text);
+                        }
+                    }
+                }
+            }
+            None
+        }
+        _ => None,
+    }
 }
 
 fn tool_system_prompt() -> String {
@@ -4725,6 +5014,188 @@ mod tests {
             extract_completion_delta_text(&value).as_deref(),
             Some("world")
         );
+    }
+
+    #[test]
+    fn extract_completion_text_reads_array_message_content() {
+        let value = json!({
+            "choices": [{
+                "message": {
+                    "content": [
+                        {"type": "text", "text": "hello "},
+                        {"type": "text", "text": "world"}
+                    ]
+                }
+            }]
+        });
+        assert_eq!(
+            extract_completion_text(&value).as_deref(),
+            Some("hello world")
+        );
+    }
+
+    #[test]
+    fn extract_completion_delta_text_reads_array_delta_content() {
+        let value = json!({
+            "choices": [{
+                "delta": {
+                    "content": [
+                        {"type": "text", "text": "chunk-a"},
+                        {"type": "text", "text": "chunk-b"}
+                    ]
+                }
+            }]
+        });
+        assert_eq!(
+            extract_completion_delta_text(&value).as_deref(),
+            Some("chunk-achunk-b")
+        );
+    }
+
+    #[test]
+    fn extract_completion_text_reads_anthropic_content_array() {
+        let value = json!({
+            "content": [
+                {"type": "text", "text": "alpha "},
+                {"type": "text", "text": "beta"}
+            ]
+        });
+        assert_eq!(
+            extract_completion_text(&value).as_deref(),
+            Some("alpha beta")
+        );
+    }
+
+    #[test]
+    fn extract_completion_delta_text_reads_anthropic_delta_text() {
+        let value = json!({
+            "type": "content_block_delta",
+            "delta": {"type": "text_delta", "text": "stream-bit"}
+        });
+        assert_eq!(
+            extract_completion_delta_text(&value).as_deref(),
+            Some("stream-bit")
+        );
+    }
+
+    #[test]
+    fn extract_completion_text_reads_reasoning_content_when_message_content_empty() {
+        let value = json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "reasoning_content": "reason-only"
+                }
+            }]
+        });
+        assert_eq!(
+            extract_completion_text(&value).as_deref(),
+            Some("reason-only")
+        );
+    }
+
+    #[test]
+    fn extract_completion_text_reads_reasoning_when_message_content_missing() {
+        let value = json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "reasoning": "thought-only"
+                }
+            }]
+        });
+        assert_eq!(
+            extract_completion_text(&value).as_deref(),
+            Some("thought-only")
+        );
+    }
+
+    #[test]
+    fn is_anthropic_messages_provider_matches_base_url_or_messages_path() {
+        let mut provider = OpenAICompatConfig::default();
+        provider.base_url = "https://api.anthropic.com/v1".to_string();
+        provider.completions_path = "/chat/completions".to_string();
+        assert!(is_anthropic_messages_provider(&provider));
+
+        provider.base_url = "https://example.invalid/v1".to_string();
+        provider.completions_path = "/messages".to_string();
+        assert!(is_anthropic_messages_provider(&provider));
+
+        provider.base_url = "https://api.openai.com/v1".to_string();
+        provider.completions_path = "/chat/completions".to_string();
+        assert!(!is_anthropic_messages_provider(&provider));
+    }
+
+    #[test]
+    fn request_prompt_text_falls_back_to_messages_content() {
+        let req: CompletionRequest = serde_json::from_value(json!({
+            "messages": [
+                {"role": "system", "content": "You are concise."},
+                {"role": "user", "content": "Do the thing."}
+            ]
+        }))
+        .expect("valid completion request");
+        assert_eq!(
+            request_prompt_text(&req),
+            "You are concise.\n\nDo the thing.".to_string()
+        );
+    }
+
+    #[test]
+    fn extract_completion_text_reads_completion_fallback_key() {
+        let value = json!({"completion": "fallback text"});
+        assert_eq!(
+            extract_completion_text(&value).as_deref(),
+            Some("fallback text")
+        );
+    }
+
+    #[test]
+    fn is_openai_responses_model_matches_codex_and_gpt5() {
+        assert!(is_openai_responses_model("gpt-5.2-codex"));
+        assert!(is_openai_responses_model("gpt-5-mini"));
+        assert!(!is_openai_responses_model("gpt-4o"));
+    }
+
+    #[test]
+    fn build_openai_responses_body_uses_input_and_max_output_tokens() {
+        let req: CompletionRequest = serde_json::from_value(json!({
+            "messages": [
+                {"role": "system", "content": "Be concise."},
+                {"role": "user", "content": "Count to 3."}
+            ],
+            "max_tokens": 42
+        }))
+        .expect("valid completion request");
+        let body = build_openai_responses_body(&req, "gpt-5.2-codex", true).expect("body");
+        assert_eq!(body["model"], "gpt-5.2-codex");
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["max_output_tokens"], 42);
+        assert_eq!(body["instructions"], "Be concise.");
+        assert_eq!(body["input"][0]["role"], "user");
+        assert_eq!(body["input"][0]["content"], "Count to 3.");
+    }
+
+    #[test]
+    fn effective_provider_path_forces_responses_path() {
+        let mut provider = OpenAICompatConfig::default();
+        provider.base_url = "https://api.openai.com/v1".to_string();
+        provider.completions_path = "/chat/completions".to_string();
+        assert_eq!(effective_provider_path(&provider, true), "/responses");
+        assert_eq!(
+            effective_provider_path(&provider, false),
+            "/chat/completions"
+        );
+    }
+
+    #[test]
+    fn is_openai_responses_provider_detects_openai_codex_models() {
+        let mut provider = OpenAICompatConfig::default();
+        provider.base_url = "https://api.openai.com/v1".to_string();
+        provider.completions_path = "/chat/completions".to_string();
+        assert!(is_openai_responses_provider(&provider, "gpt-5.2-codex"));
+        assert!(!is_openai_responses_provider(&provider, "gpt-4o"));
     }
 }
 
