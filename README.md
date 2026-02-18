@@ -114,7 +114,7 @@ ai --provider local-3000 --model gemini-3-pro-preview "Count to 5 slowly"
 ## Example
 
 ```
- gab  ~/gsh_codex   main ±  ai write a poem inspired by all my logs
+ gab  ~/aish   main ±  ai write a poem inspired by all my logs
 **The Engine's Echo**
 
 In the rust-lang depths where cargo builds,
