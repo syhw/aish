@@ -533,11 +533,11 @@ async fn completions_stream(
                 &req_for_stream,
                 |delta| {
                     if !first_chunk_seen_for_stream.swap(true, Ordering::SeqCst) {
-                        let _ = tx_for_stream.blocking_send(CompletionStreamChunk::Status(
+                        let _ = tx_for_stream.try_send(CompletionStreamChunk::Status(
                             completion_phase_label(&req_for_stream, "stream"),
                         ));
                     }
-                    let _ = tx_for_stream.blocking_send(CompletionStreamChunk::Delta(delta));
+                    let _ = tx_for_stream.try_send(CompletionStreamChunk::Delta(delta));
                 },
             )
         })

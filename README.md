@@ -363,6 +363,10 @@ Reboot/restart resume workflow test:
 ```bash
 scripts/test_resume_workflow.sh
 ```
+OpenAI-compatible Rig routing integration test (isolated daemon + mock provider):
+```bash
+scripts/test_openai_compat_rig_integration.sh
+```
 
 ## Usage Examples
 See `EXAMPLES.md` for copy-paste workflows covering:

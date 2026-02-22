@@ -27,6 +27,11 @@ Restart/resume workflow test (isolated daemon/config):
 scripts/test_resume_workflow.sh
 ```
 
+OpenAI-compatible Rig routing workflow (isolated daemon + local mock provider):
+```
+scripts/test_openai_compat_rig_integration.sh
+```
+
 ## Tests (manual description)
 
 ### 1) Health + Version
@@ -106,3 +111,13 @@ Optional (LLM):
   - agent/subagent tmux sessions are recreated
   - per-session human tmux view is restored (main only)
   - resumed agents can execute new flow tasks successfully
+
+### 14) OpenAI-Compatible Rig Routing (isolated mock provider)
+- Starts isolated `aishd` plus local mock provider.
+- Validates `/v1/completions` routing/behavior across:
+  - `/v1/chat/completions`
+  - `/v1/completions` (raw)
+  - `/v1/responses`
+  - `/v1/messages` (Anthropic-style)
+- Validates `/v1/completions/stream` for raw-completions SSE deltas/end event.
+- Asserts request payload mapping (prompt composition, stream flag, anthropic `max_tokens`).

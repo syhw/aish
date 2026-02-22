@@ -11,6 +11,9 @@ set -euo pipefail
 BASE_URL="${AISHD_URL:-http://127.0.0.1:5033}"
 REPO_ROOT="${REPO_ROOT:-$(pwd)}"
 TMP_DIR="${TMP_DIR:-/tmp/aish_it}"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+RUN_RIG_ROUTING_IT="${AISHD_INCLUDE_RIG_ROUTING_IT:-0}"
+RIG_ROUTING_SCRIPT="${AISHD_RIG_ROUTING_SCRIPT:-${SCRIPT_DIR}/test_openai_compat_rig_integration.sh}"
 RED=$'\033[31m'
 GREEN=$'\033[32m'
 RESET=$'\033[0m'
@@ -312,6 +315,23 @@ test_tmux_diagnostics() {
   json_assert "${tmux_diag}" 'data.get("ok") in (True, False)' "expected tmux diagnostics ok boolean"
 }
 
+# Optional Test 12: isolated OpenAI-compatible Rig routing integration
+test_openai_compat_rig_routing() {
+  if [[ "${RUN_RIG_ROUTING_IT}" != "1" ]]; then
+    echo "skipped: set AISHD_INCLUDE_RIG_ROUTING_IT=1 to run Rig routing integration"
+    return 0
+  fi
+  if [[ ! -x "${RIG_ROUTING_SCRIPT}" ]]; then
+    echo "skipped: rig routing script not executable at ${RIG_ROUTING_SCRIPT}"
+    return 0
+  fi
+  if ! command -v cargo >/dev/null 2>&1; then
+    echo "skipped: cargo required for rig routing integration"
+    return 0
+  fi
+  "${RIG_ROUTING_SCRIPT}"
+}
+
 run_test "health + version" "verifies /health ok and /version includes version" test_health_version
 run_test "tools list + shell/fs calls" "verifies tool list and fs helpers work" test_tools_and_fs
 run_test "sessions + agents + tmux" "creates a session + agent and confirms tmux session exists" test_sessions_agents_tmux
@@ -324,6 +344,7 @@ run_test "flow run (non-stream)" "executes a tool-only flow and checks outputs" 
 run_test "flow run with LLM aggregate" "executes a flow with LLM aggregation" test_flow_run_llm
 run_test "flow stream + cancel" "streams flow events and attempts cancellation" test_flow_stream_cancel
 run_test "tmux diagnostics" "checks tmux diagnostics endpoint" test_tmux_diagnostics
+run_test "openai-compat rig routing (optional)" "runs isolated provider routing + streaming checks when enabled" test_openai_compat_rig_routing
 
 if [[ "${FAILURES}" -ne 0 ]]; then
   printf "%b✗%b %d test(s) failed: %s\n" "${RED}" "${RESET}" "${FAILURES}" "${FAILED_TESTS[*]}" >&2
