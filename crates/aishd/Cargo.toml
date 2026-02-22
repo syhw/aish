@@ -16,4 +16,5 @@ ureq = { workspace = true }
 chrono = { workspace = true }
 tokio-stream = { workspace = true }
 rusqlite = { workspace = true }
+rig-core = { workspace = true }
 aish_core = { path = "../aish_core" }

@@ -12,12 +12,20 @@ use axum::{
 };
 use chrono::Utc;
 use clap::Parser;
+use rig::completion::{
+    self as rig_completion, AssistantContent as RigAssistantContent, CompletionModel as _,
+    Message as RigMessage,
+};
+use rig::http_client::{self as rig_http, HttpClientExt as _};
+use rig::prelude::CompletionClient as _;
+use rig::providers::{anthropic as rig_anthropic, openai as rig_openai};
+use rig::streaming::StreamedAssistantContent as RigStreamedAssistantContent;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -2529,98 +2537,39 @@ async fn diagnostics_tmux() -> Response {
     (StatusCode::OK, Json(DiagnosticReport { ok, steps })).into_response()
 }
 
+#[derive(Clone, Debug)]
+struct RigEndpoint {
+    api: RigApi,
+    base_url: String,
+    path: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RigApi {
+    Responses,
+    ChatCompletions,
+    AnthropicMessages,
+    OpenAICompatRaw,
+}
+
 fn call_openai_compat_completions(
     provider: &OpenAICompatConfig,
     api_key: &str,
     model: &str,
     req: &CompletionRequest,
 ) -> Result<Value, (u16, Value)> {
-    let uses_openai_responses = is_openai_responses_provider(provider, model);
-    let endpoint_path = effective_provider_path(provider, uses_openai_responses);
-    let url = build_provider_url(provider, &endpoint_path);
-    let is_anthropic = is_anthropic_messages_provider(provider);
-    let endpoint_path_lower = endpoint_path.to_ascii_lowercase();
-    let is_chat = !uses_openai_responses
-        && (endpoint_path_lower.contains("chat/completions")
-            || endpoint_path_lower.ends_with("/messages"));
-    let mut body = if uses_openai_responses {
-        build_openai_responses_body(req, model, req.stream == Some(true))?
-    } else {
+    if let Some(endpoint) = resolve_rig_endpoint(provider, api_key, model) {
+        return call_openai_compat_completions_rig(&endpoint, api_key, model, req);
+    }
+    Err((
+        400,
         json!({
-            "model": model,
-        })
-    };
-    if !uses_openai_responses && is_chat {
-        let messages = if let Some(messages) = &req.messages {
-            messages.clone()
-        } else if let Some(prompt) = req.prompt.as_deref() {
-            if prompt.trim().is_empty() {
-                return Err((400, json!({"error": "prompt or messages required"})));
-            }
-            vec![ChatMessage {
-                role: "user".to_string(),
-                content: prompt.to_string(),
-            }]
-        } else {
-            return Err((400, json!({"error": "prompt or messages required"})));
-        };
-        body["messages"] = json!(messages);
-    } else if !uses_openai_responses {
-        let prompt = request_prompt_text(req);
-        if prompt.trim().is_empty() {
-            return Err((400, json!({"error": "prompt is required"})));
-        }
-        body["prompt"] = json!(prompt);
-    }
-    if !uses_openai_responses {
-        if let Some(max_tokens) = req.max_tokens {
-            body["max_tokens"] = json!(max_tokens);
-        } else if is_anthropic {
-            // Anthropic messages API requires max_tokens.
-            body["max_tokens"] = json!(1024);
-        }
-        if let Some(temperature) = req.temperature {
-            body["temperature"] = json!(temperature);
-        }
-        if let Some(top_p) = req.top_p {
-            body["top_p"] = json!(top_p);
-        }
-        if let Some(stop) = &req.stop {
-            body["stop"] = json!(stop);
-        }
-    }
-    if !uses_openai_responses && req.stream == Some(true) {
-        body["stream"] = json!(true);
-    }
-
-    let agent = ureq::AgentBuilder::new()
-        .timeout(Duration::from_secs(60))
-        .build();
-    let mut http = agent.post(&url).set("Content-Type", "application/json");
-    if !api_key.trim().is_empty() {
-        if is_anthropic {
-            http = http
-                .set("x-api-key", api_key)
-                .set("anthropic-version", "2023-06-01");
-        } else {
-            http = http.set("Authorization", &format!("Bearer {}", api_key));
-        }
-    }
-    let response = http.send_string(&body.to_string());
-
-    match response {
-        Ok(resp) => {
-            let text = resp.into_string().unwrap_or_default();
-            let parsed = serde_json::from_str(&text).unwrap_or_else(|_| json!({ "raw": text }));
-            Ok(parsed)
-        }
-        Err(ureq::Error::Status(status, resp)) => {
-            let text = resp.into_string().unwrap_or_default();
-            let parsed = serde_json::from_str(&text).unwrap_or_else(|_| json!({ "raw": text }));
-            Err((status, parsed))
-        }
-        Err(err) => Err((502, json!({ "error": err.to_string() }))),
-    }
+            "error": format!(
+                "unsupported completion endpoint for Rig: {}",
+                effective_provider_path(provider, is_openai_responses_provider(provider, model))
+            )
+        }),
+    ))
 }
 
 fn call_openai_compat_completions_streaming<F>(
@@ -2628,141 +2577,753 @@ fn call_openai_compat_completions_streaming<F>(
     api_key: &str,
     model: &str,
     req: &CompletionRequest,
+    on_delta: F,
+) -> Result<String, (u16, Value)>
+where
+    F: FnMut(String),
+{
+    if let Some(endpoint) = resolve_rig_endpoint(provider, api_key, model) {
+        return call_openai_compat_completions_streaming_rig(
+            &endpoint, api_key, model, req, on_delta,
+        );
+    }
+    Err((
+        400,
+        json!({
+            "error": format!(
+                "unsupported streaming endpoint for Rig: {}",
+                effective_provider_path(provider, is_openai_responses_provider(provider, model))
+            )
+        }),
+    ))
+}
+
+fn resolve_rig_endpoint(
+    provider: &OpenAICompatConfig,
+    api_key: &str,
+    model: &str,
+) -> Option<RigEndpoint> {
+    let uses_openai_responses = is_openai_responses_provider(provider, model);
+    let endpoint_path = effective_provider_path(provider, uses_openai_responses);
+    let endpoint_path_lower = endpoint_path.to_ascii_lowercase();
+    if is_anthropic_messages_provider(provider) {
+        if api_key.trim().is_empty() {
+            return None;
+        }
+        let full_url = build_provider_url(provider, &endpoint_path);
+        let full_url = full_url.trim_end_matches('/');
+        let base_url = full_url
+            .strip_suffix("/v1/messages")
+            .or_else(|| full_url.strip_suffix("/messages"))?
+            .trim_end_matches('/');
+        if base_url.is_empty() {
+            return None;
+        }
+        return Some(RigEndpoint {
+            api: RigApi::AnthropicMessages,
+            base_url: base_url.to_string(),
+            path: None,
+        });
+    }
+
+    if uses_openai_responses {
+        let full_url = build_provider_url(provider, &endpoint_path);
+        let full_url = full_url.trim_end_matches('/');
+        let base_url = full_url.strip_suffix("/responses")?.trim_end_matches('/');
+        if base_url.is_empty() {
+            return None;
+        }
+        return Some(RigEndpoint {
+            api: RigApi::Responses,
+            base_url: base_url.to_string(),
+            path: None,
+        });
+    }
+
+    if endpoint_path_lower.contains("chat/completions") {
+        let full_url = build_provider_url(provider, &endpoint_path);
+        let full_url = full_url.trim_end_matches('/');
+        let base_url = full_url
+            .strip_suffix("/chat/completions")?
+            .trim_end_matches('/');
+        if base_url.is_empty() {
+            return None;
+        }
+        return Some(RigEndpoint {
+            api: RigApi::ChatCompletions,
+            base_url: base_url.to_string(),
+            path: None,
+        });
+    }
+
+    let (base_url, path) = split_base_and_path(provider, &endpoint_path)?;
+    if base_url.trim().is_empty() || path.trim().is_empty() {
+        return None;
+    }
+    Some(RigEndpoint {
+        api: RigApi::OpenAICompatRaw,
+        base_url,
+        path: Some(path),
+    })
+}
+
+fn split_base_and_path(
+    provider: &OpenAICompatConfig,
+    endpoint_path: &str,
+) -> Option<(String, String)> {
+    if endpoint_path.starts_with("http://") || endpoint_path.starts_with("https://") {
+        let scheme_pos = endpoint_path.find("://")?;
+        let rest = &endpoint_path[scheme_pos + 3..];
+        let slash_pos = rest.find('/').unwrap_or(rest.len());
+        let base_end = scheme_pos + 3 + slash_pos;
+        let base = endpoint_path[..base_end].trim_end_matches('/').to_string();
+        let mut path = if slash_pos == rest.len() {
+            "/".to_string()
+        } else {
+            format!("/{}", &rest[slash_pos + 1..])
+        };
+        if path.is_empty() {
+            path = "/".to_string();
+        }
+        return Some((base, path));
+    }
+
+    let base = provider.base_url.trim_end_matches('/').to_string();
+    let path = if endpoint_path.starts_with('/') {
+        endpoint_path.to_string()
+    } else {
+        format!("/{}", endpoint_path)
+    };
+    Some((base, path))
+}
+
+fn call_openai_compat_completions_rig(
+    endpoint: &RigEndpoint,
+    api_key: &str,
+    model: &str,
+    req: &CompletionRequest,
+) -> Result<Value, (u16, Value)> {
+    let endpoint = endpoint.clone();
+    let api_key = api_key.to_string();
+    let model = model.to_string();
+    let req = req.clone();
+    block_on_with_runtime(async move {
+        call_openai_compat_completions_rig_async(endpoint, api_key, model, req).await
+    })
+}
+
+async fn call_openai_compat_completions_rig_async(
+    endpoint: RigEndpoint,
+    api_key: String,
+    model: String,
+    req: CompletionRequest,
+) -> Result<Value, (u16, Value)> {
+    let (preamble, mut messages) = rig_prompt_and_history(&req)?;
+    let prompt = messages
+        .pop()
+        .ok_or_else(|| (400, json!({"error": "prompt or messages required"})))?;
+    let rig_openai_api_key = if api_key.trim().is_empty() {
+        "local-no-auth".to_string()
+    } else {
+        api_key.clone()
+    };
+
+    let prompt_chat = prompt.clone();
+    let preamble_chat = preamble.clone();
+    let messages_chat = messages.clone();
+    match endpoint.api {
+        RigApi::Responses => {
+            let client: rig_openai::Client = rig_openai::Client::builder()
+                .api_key(rig_openai_api_key.clone())
+                .base_url(&endpoint.base_url)
+                .build()
+                .map_err(rig_http_error_to_response)?;
+            let model_client = client.completion_model(model);
+            let builder = apply_rig_request_options(
+                model_client.completion_request(prompt),
+                &req,
+                preamble,
+                messages,
+                RigApi::Responses,
+            );
+            let response = builder
+                .send()
+                .await
+                .map_err(rig_completion_error_to_response)?;
+            rig_completion_response_to_value(response)
+        }
+        RigApi::ChatCompletions => {
+            let client: rig_openai::Client = rig_openai::Client::builder()
+                .api_key(rig_openai_api_key.clone())
+                .base_url(&endpoint.base_url)
+                .build()
+                .map_err(rig_http_error_to_response)?;
+            let model_client = client.completions_api().completion_model(model);
+            let builder = apply_rig_request_options(
+                model_client.completion_request(prompt_chat),
+                &req,
+                preamble_chat,
+                messages_chat,
+                RigApi::ChatCompletions,
+            );
+            let response = builder
+                .send()
+                .await
+                .map_err(rig_completion_error_to_response)?;
+            rig_completion_response_to_value(response)
+        }
+        RigApi::AnthropicMessages => {
+            let client: rig_anthropic::Client = rig_anthropic::Client::builder()
+                .api_key(api_key)
+                .base_url(&endpoint.base_url)
+                .build()
+                .map_err(rig_http_error_to_response)?;
+            let model_client = client.completion_model(model);
+            let builder = apply_rig_request_options(
+                model_client.completion_request(prompt_chat),
+                &req,
+                preamble_chat,
+                messages_chat,
+                RigApi::AnthropicMessages,
+            );
+            let response = builder
+                .send()
+                .await
+                .map_err(rig_completion_error_to_response)?;
+            rig_completion_response_to_value(response)
+        }
+        RigApi::OpenAICompatRaw => {
+            let path = endpoint
+                .path
+                .as_deref()
+                .ok_or_else(|| (500, json!({"error": "missing raw endpoint path"})))?;
+            let body = build_openai_compat_raw_body(&model, &req, false)?;
+            call_openai_compat_raw_with_rig(&endpoint.base_url, path, &rig_openai_api_key, body)
+                .await
+        }
+    }
+}
+
+fn call_openai_compat_completions_streaming_rig<F>(
+    endpoint: &RigEndpoint,
+    api_key: &str,
+    model: &str,
+    req: &CompletionRequest,
+    on_delta: F,
+) -> Result<String, (u16, Value)>
+where
+    F: FnMut(String),
+{
+    let endpoint = endpoint.clone();
+    let api_key = api_key.to_string();
+    let model = model.to_string();
+    let req = req.clone();
+    block_on_with_runtime(async move {
+        call_openai_compat_completions_streaming_rig_async(endpoint, api_key, model, req, on_delta)
+            .await
+    })
+}
+
+async fn call_openai_compat_completions_streaming_rig_async<F>(
+    endpoint: RigEndpoint,
+    api_key: String,
+    model: String,
+    req: CompletionRequest,
     mut on_delta: F,
 ) -> Result<String, (u16, Value)>
 where
     F: FnMut(String),
 {
-    let uses_openai_responses = is_openai_responses_provider(provider, model);
-    let endpoint_path = effective_provider_path(provider, uses_openai_responses);
-    let url = build_provider_url(provider, &endpoint_path);
-    let is_anthropic = is_anthropic_messages_provider(provider);
-    let endpoint_path_lower = endpoint_path.to_ascii_lowercase();
-    let is_chat = !uses_openai_responses
-        && (endpoint_path_lower.contains("chat/completions")
-            || endpoint_path_lower.ends_with("/messages"));
-    let mut body = if uses_openai_responses {
-        build_openai_responses_body(req, model, true)?
+    let (preamble, mut messages) = rig_prompt_and_history(&req)?;
+    let prompt = messages
+        .pop()
+        .ok_or_else(|| (400, json!({"error": "prompt or messages required"})))?;
+    let rig_openai_api_key = if api_key.trim().is_empty() {
+        "local-no-auth".to_string()
     } else {
-        json!({
-            "model": model,
-            "stream": true,
-        })
+        api_key.clone()
     };
-    if !uses_openai_responses && is_chat {
-        let messages = if let Some(messages) = &req.messages {
-            messages.clone()
-        } else if let Some(prompt) = req.prompt.as_deref() {
-            if prompt.trim().is_empty() {
-                return Err((400, json!({"error": "prompt or messages required"})));
-            }
-            vec![ChatMessage {
-                role: "user".to_string(),
-                content: prompt.to_string(),
-            }]
-        } else {
-            return Err((400, json!({"error": "prompt or messages required"})));
-        };
-        body["messages"] = json!(messages);
-    } else if !uses_openai_responses {
-        let prompt = request_prompt_text(req);
-        if prompt.trim().is_empty() {
-            return Err((400, json!({"error": "prompt is required"})));
+
+    let prompt_chat = prompt.clone();
+    let preamble_chat = preamble.clone();
+    let messages_chat = messages.clone();
+    let full_text = match endpoint.api {
+        RigApi::Responses => {
+            let client: rig_openai::Client = rig_openai::Client::builder()
+                .api_key(rig_openai_api_key.clone())
+                .base_url(&endpoint.base_url)
+                .build()
+                .map_err(rig_http_error_to_response)?;
+            let model_client = client.completion_model(model.clone());
+            let builder = apply_rig_request_options(
+                model_client.completion_request(prompt),
+                &req,
+                preamble,
+                messages,
+                RigApi::Responses,
+            );
+            let stream = builder
+                .stream()
+                .await
+                .map_err(rig_completion_error_to_response)?;
+            consume_rig_stream(stream, &mut on_delta).await?
         }
-        body["prompt"] = json!(prompt);
+        RigApi::ChatCompletions => {
+            let client: rig_openai::Client = rig_openai::Client::builder()
+                .api_key(rig_openai_api_key.clone())
+                .base_url(&endpoint.base_url)
+                .build()
+                .map_err(rig_http_error_to_response)?;
+            let model_client = client.completions_api().completion_model(model.clone());
+            let builder = apply_rig_request_options(
+                model_client.completion_request(prompt_chat),
+                &req,
+                preamble_chat,
+                messages_chat,
+                RigApi::ChatCompletions,
+            );
+            let stream = builder
+                .stream()
+                .await
+                .map_err(rig_completion_error_to_response)?;
+            consume_rig_stream(stream, &mut on_delta).await?
+        }
+        RigApi::AnthropicMessages => {
+            let client: rig_anthropic::Client = rig_anthropic::Client::builder()
+                .api_key(api_key.clone())
+                .base_url(&endpoint.base_url)
+                .build()
+                .map_err(rig_http_error_to_response)?;
+            let model_client = client.completion_model(model.clone());
+            let builder = apply_rig_request_options(
+                model_client.completion_request(prompt_chat),
+                &req,
+                preamble_chat,
+                messages_chat,
+                RigApi::AnthropicMessages,
+            );
+            let stream = builder
+                .stream()
+                .await
+                .map_err(rig_completion_error_to_response)?;
+            consume_rig_stream(stream, &mut on_delta).await?
+        }
+        RigApi::OpenAICompatRaw => {
+            let path = endpoint
+                .path
+                .as_deref()
+                .ok_or_else(|| (500, json!({"error": "missing raw endpoint path"})))?;
+            let body = build_openai_compat_raw_body(&model, &req, true)?;
+            call_openai_compat_raw_streaming_with_rig(
+                &endpoint.base_url,
+                path,
+                &rig_openai_api_key,
+                body,
+                &mut on_delta,
+            )
+            .await?
+        }
+    };
+
+    if !full_text.is_empty() {
+        return Ok(full_text);
     }
-    if !uses_openai_responses {
-        if let Some(max_tokens) = req.max_tokens {
-            body["max_tokens"] = json!(max_tokens);
-        } else if is_anthropic {
-            // Anthropic messages API requires max_tokens.
-            body["max_tokens"] = json!(1024);
+
+    let fallback = call_openai_compat_completions_rig_async(endpoint, api_key, model, req).await?;
+    if let Some(text) = extract_completion_text(&fallback) {
+        if !text.is_empty() {
+            on_delta(text.clone());
+            return Ok(text);
         }
-        if let Some(temperature) = req.temperature {
-            body["temperature"] = json!(temperature);
+    }
+    Err((502, json!({"error": "no completion text returned"})))
+}
+
+fn rig_prompt_and_history(
+    req: &CompletionRequest,
+) -> Result<(Option<String>, Vec<RigMessage>), (u16, Value)> {
+    let source_messages = if let Some(messages) = &req.messages {
+        messages.clone()
+    } else if let Some(prompt) = req.prompt.as_deref() {
+        if prompt.trim().is_empty() {
+            return Err((400, json!({"error": "prompt or messages required"})));
         }
-        if let Some(top_p) = req.top_p {
-            body["top_p"] = json!(top_p);
+        vec![ChatMessage {
+            role: "user".to_string(),
+            content: prompt.to_string(),
+        }]
+    } else {
+        return Err((400, json!({"error": "prompt or messages required"})));
+    };
+
+    let mut preamble = Vec::new();
+    let mut rig_messages = Vec::new();
+    for msg in source_messages {
+        let content = msg.content.trim();
+        if content.is_empty() {
+            continue;
         }
-        if let Some(stop) = &req.stop {
+        let role = msg.role.trim().to_ascii_lowercase();
+        match role.as_str() {
+            "system" => preamble.push(content.to_string()),
+            "assistant" => rig_messages.push(RigMessage::assistant(content)),
+            _ => rig_messages.push(RigMessage::user(content)),
+        }
+    }
+
+    if rig_messages.is_empty() {
+        return Err((400, json!({"error": "prompt or messages required"})));
+    }
+
+    let preamble = if preamble.is_empty() {
+        None
+    } else {
+        Some(preamble.join("\n\n"))
+    };
+    Ok((preamble, rig_messages))
+}
+
+fn apply_rig_request_options<M>(
+    mut builder: rig_completion::CompletionRequestBuilder<M>,
+    req: &CompletionRequest,
+    preamble: Option<String>,
+    messages: Vec<RigMessage>,
+    api: RigApi,
+) -> rig_completion::CompletionRequestBuilder<M>
+where
+    M: rig_completion::CompletionModel,
+{
+    if !messages.is_empty() {
+        builder = builder.messages(messages);
+    }
+    if let Some(preamble) = preamble {
+        builder = builder.preamble(preamble);
+    }
+    if let Some(temperature) = req.temperature {
+        builder = builder.temperature(temperature as f64);
+    }
+    if let Some(max_tokens) = req.max_tokens.or_else(|| {
+        if api == RigApi::AnthropicMessages {
+            Some(1024)
+        } else {
+            None
+        }
+    }) {
+        builder = builder.max_tokens(max_tokens as u64);
+    }
+    if let Some(additional) = rig_additional_params(req, api) {
+        builder = builder.additional_params(additional);
+    }
+    builder
+}
+
+fn rig_additional_params(req: &CompletionRequest, api: RigApi) -> Option<Value> {
+    let mut map = serde_json::Map::new();
+    if let Some(top_p) = req.top_p {
+        map.insert("top_p".to_string(), json!(top_p));
+    }
+    if let Some(stop) = &req.stop {
+        if !stop.is_empty() {
+            if api == RigApi::AnthropicMessages {
+                map.insert("stop_sequences".to_string(), json!(stop));
+            } else {
+                map.insert("stop".to_string(), json!(stop));
+            }
+        }
+    }
+    if map.is_empty() {
+        None
+    } else {
+        Some(Value::Object(map))
+    }
+}
+
+fn build_openai_compat_raw_body(
+    model: &str,
+    req: &CompletionRequest,
+    stream: bool,
+) -> Result<Value, (u16, Value)> {
+    let prompt = request_prompt_text(req);
+    if prompt.trim().is_empty() {
+        return Err((400, json!({"error": "prompt is required"})));
+    }
+
+    let mut body = json!({
+        "model": model,
+        "prompt": prompt,
+    });
+    if stream {
+        body["stream"] = json!(true);
+    }
+    if let Some(max_tokens) = req.max_tokens {
+        body["max_tokens"] = json!(max_tokens);
+    }
+    if let Some(temperature) = req.temperature {
+        body["temperature"] = json!(temperature);
+    }
+    if let Some(top_p) = req.top_p {
+        body["top_p"] = json!(top_p);
+    }
+    if let Some(stop) = &req.stop {
+        if !stop.is_empty() {
             body["stop"] = json!(stop);
         }
     }
+    Ok(body)
+}
 
-    let agent = ureq::AgentBuilder::new()
-        .timeout(Duration::from_secs(300))
-        .build();
-    let mut http = agent
-        .post(&url)
-        .set("Content-Type", "application/json")
-        .set("Accept", "text/event-stream");
-    if !api_key.trim().is_empty() {
-        if is_anthropic {
-            http = http
-                .set("x-api-key", api_key)
-                .set("anthropic-version", "2023-06-01");
-        } else {
-            http = http.set("Authorization", &format!("Bearer {}", api_key));
+async fn call_openai_compat_raw_with_rig(
+    base_url: &str,
+    path: &str,
+    api_key: &str,
+    body: Value,
+) -> Result<Value, (u16, Value)> {
+    let client: rig_openai::Client = rig_openai::Client::builder()
+        .api_key(api_key.to_string())
+        .base_url(base_url)
+        .build()
+        .map_err(rig_http_error_to_response)?;
+
+    let req = client
+        .post(path)
+        .map_err(rig_http_error_to_response)?
+        .body(body.to_string().into_bytes())
+        .map_err(|err| (500, json!({"error": err.to_string()})))?;
+    let response = client.send(req).await.map_err(rig_http_error_to_response)?;
+    let text = rig_http::text(response)
+        .await
+        .map_err(rig_http_error_to_response)?;
+    Ok(serde_json::from_str(&text).unwrap_or_else(|_| json!({ "raw": text })))
+}
+
+async fn call_openai_compat_raw_streaming_with_rig<F>(
+    base_url: &str,
+    path: &str,
+    api_key: &str,
+    body: Value,
+    on_delta: &mut F,
+) -> Result<String, (u16, Value)>
+where
+    F: FnMut(String),
+{
+    let client: rig_openai::Client = rig_openai::Client::builder()
+        .api_key(api_key.to_string())
+        .base_url(base_url)
+        .build()
+        .map_err(rig_http_error_to_response)?;
+
+    let req = client
+        .post(path)
+        .map_err(rig_http_error_to_response)?
+        .header("Accept", "text/event-stream")
+        .body(body.to_string().into_bytes())
+        .map_err(|err| (500, json!({"error": err.to_string()})))?;
+    let response = client
+        .send_streaming(req)
+        .await
+        .map_err(rig_http_error_to_response)?;
+
+    let mut stream = response.into_body();
+    let mut pending = String::new();
+    let mut full_text = String::new();
+    let mut done = false;
+
+    while let Some(chunk) = stream.next().await {
+        let bytes = chunk.map_err(rig_http_error_to_response)?;
+        pending.push_str(&String::from_utf8_lossy(&bytes));
+        while let Some(pos) = pending.find('\n') {
+            let mut line = pending[..pos].to_string();
+            pending.drain(..pos + 1);
+            if line.ends_with('\r') {
+                line.pop();
+            }
+            if process_completion_sse_line(&line, on_delta, &mut full_text) {
+                done = true;
+                break;
+            }
+        }
+        if done {
+            break;
         }
     }
-    let response = http.send_string(&body.to_string());
 
-    match response {
-        Ok(resp) => {
-            let mut reader = BufReader::new(resp.into_reader());
-            let mut line = String::new();
-            let mut full_text = String::new();
-            while let Ok(read) = reader.read_line(&mut line) {
-                if read == 0 {
-                    break;
+    if !done && !pending.is_empty() {
+        let line = std::mem::take(&mut pending);
+        let _ = process_completion_sse_line(&line, on_delta, &mut full_text);
+    }
+
+    if !full_text.is_empty() {
+        return Ok(full_text);
+    }
+
+    let mut fallback_body = body;
+    if let Some(map) = fallback_body.as_object_mut() {
+        map.remove("stream");
+    }
+    let fallback = call_openai_compat_raw_with_rig(base_url, path, api_key, fallback_body).await?;
+    if let Some(text) = extract_completion_text(&fallback) {
+        if !text.is_empty() {
+            on_delta(text.clone());
+            return Ok(text);
+        }
+    }
+    Err((502, json!({"error": "no completion text returned"})))
+}
+
+fn process_completion_sse_line<F>(line: &str, on_delta: &mut F, full_text: &mut String) -> bool
+where
+    F: FnMut(String),
+{
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let data = trimmed
+        .strip_prefix("data:")
+        .map(|v| v.trim())
+        .unwrap_or(trimmed);
+    if data == "[DONE]" {
+        return true;
+    }
+    if let Ok(value) = serde_json::from_str::<Value>(data) {
+        if let Some(delta) = extract_completion_delta_text(&value) {
+            if !delta.is_empty() {
+                on_delta(delta.clone());
+                full_text.push_str(&delta);
+            }
+        } else if let Some(text) = extract_completion_text(&value) {
+            if !text.is_empty() {
+                on_delta(text.clone());
+                full_text.push_str(&text);
+            }
+        }
+    }
+    false
+}
+
+fn rig_choice_text(choice: &rig::OneOrMany<RigAssistantContent>) -> String {
+    let mut out = String::new();
+    for item in choice.iter() {
+        match item {
+            RigAssistantContent::Text(text) => out.push_str(&text.text),
+            RigAssistantContent::Reasoning(reasoning) => {
+                for entry in &reasoning.reasoning {
+                    out.push_str(entry);
                 }
-                let trimmed = line.trim();
-                if trimmed.is_empty() {
-                    line.clear();
-                    continue;
+            }
+            RigAssistantContent::ToolCall(_) | RigAssistantContent::Image(_) => {}
+        }
+    }
+    out
+}
+
+fn rig_completion_response_to_value<R>(
+    response: rig_completion::CompletionResponse<R>,
+) -> Result<Value, (u16, Value)>
+where
+    R: Serialize,
+{
+    let raw = serde_json::to_value(&response.raw_response).unwrap_or(Value::Null);
+    let mut text = rig_choice_text(&response.choice);
+    if text.trim().is_empty() {
+        text = extract_completion_text(&raw).unwrap_or_default();
+    }
+
+    if text.trim().is_empty() {
+        if raw.is_null() {
+            return Err((502, json!({"error": "no completion text returned"})));
+        }
+        return Ok(json!({ "raw": raw }));
+    }
+
+    let mut out = json!({
+        "choices": [{
+            "message": { "content": text }
+        }]
+    });
+    if !raw.is_null() {
+        out["raw"] = raw;
+    }
+    Ok(out)
+}
+
+async fn consume_rig_stream<R, F>(
+    mut stream: rig::streaming::StreamingCompletionResponse<R>,
+    on_delta: &mut F,
+) -> Result<String, (u16, Value)>
+where
+    R: Clone + Unpin + rig_completion::GetTokenUsage,
+    F: FnMut(String),
+{
+    let mut full_text = String::new();
+    while let Some(chunk) = stream.next().await {
+        match chunk {
+            Ok(RigStreamedAssistantContent::Text(text)) => {
+                if !text.text.is_empty() {
+                    on_delta(text.text.clone());
+                    full_text.push_str(&text.text);
                 }
-                let data = trimmed
-                    .strip_prefix("data:")
-                    .map(|v| v.trim())
-                    .unwrap_or(trimmed);
-                if data == "[DONE]" {
-                    break;
-                }
-                if let Ok(value) = serde_json::from_str::<Value>(data) {
-                    if let Some(delta) = extract_completion_delta_text(&value) {
-                        if !delta.is_empty() {
-                            on_delta(delta.clone());
-                            full_text.push_str(&delta);
-                        }
-                    } else if let Some(text) = extract_completion_text(&value) {
-                        if !text.is_empty() {
-                            on_delta(text.clone());
-                            full_text.push_str(&text);
-                        }
+            }
+            Ok(RigStreamedAssistantContent::Reasoning(reasoning)) => {
+                for item in reasoning.reasoning {
+                    if !item.is_empty() {
+                        on_delta(item.clone());
+                        full_text.push_str(&item);
                     }
                 }
-                line.clear();
             }
-
-            if !full_text.is_empty() {
-                return Ok(full_text);
-            }
-
-            let fallback = call_openai_compat_completions(provider, api_key, model, req)?;
-            if let Some(text) = extract_completion_text(&fallback) {
-                if !text.is_empty() {
-                    on_delta(text.clone());
-                    return Ok(text);
-                }
-            }
-            Err((502, json!({"error": "no completion text returned"})))
+            Ok(_) => {}
+            Err(err) => return Err(rig_completion_error_to_response(err)),
         }
-        Err(ureq::Error::Status(status, resp)) => {
-            let text = resp.into_string().unwrap_or_default();
-            let parsed = serde_json::from_str(&text).unwrap_or_else(|_| json!({ "raw": text }));
-            Err((status, parsed))
+    }
+    Ok(full_text)
+}
+
+fn block_on_with_runtime<F, T>(future: F) -> Result<T, (u16, Value)>
+where
+    F: Future<Output = Result<T, (u16, Value)>>,
+{
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        return tokio::task::block_in_place(|| handle.block_on(future));
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|err| {
+            (
+                500,
+                json!({"error": format!("failed to build async runtime: {err}")}),
+            )
+        })?;
+    runtime.block_on(future)
+}
+
+fn rig_completion_error_to_response(err: rig_completion::CompletionError) -> (u16, Value) {
+    match err {
+        rig_completion::CompletionError::HttpError(http_err) => {
+            rig_http_error_to_response(http_err)
         }
-        Err(err) => Err((502, json!({ "error": err.to_string() }))),
+        rig_completion::CompletionError::ProviderError(msg) => {
+            let parsed =
+                serde_json::from_str::<Value>(&msg).unwrap_or_else(|_| json!({"error": msg}));
+            (502, parsed)
+        }
+        other => (502, json!({"error": other.to_string()})),
+    }
+}
+
+fn rig_http_error_to_response(err: rig::http_client::Error) -> (u16, Value) {
+    match err {
+        rig::http_client::Error::InvalidStatusCodeWithMessage(status, body) => {
+            let parsed =
+                serde_json::from_str::<Value>(&body).unwrap_or_else(|_| json!({"raw": body}));
+            (status.as_u16(), parsed)
+        }
+        rig::http_client::Error::InvalidStatusCode(status) => (
+            status.as_u16(),
+            json!({"error": format!("provider status {status}")}),
+        ),
+        other => (502, json!({"error": other.to_string()})),
     }
 }
 
@@ -2816,74 +3377,6 @@ fn build_provider_url(provider: &OpenAICompatConfig, endpoint_path: &str) -> Str
         format!("/{}", endpoint_path)
     };
     format!("{base}{path}")
-}
-
-fn build_openai_responses_body(
-    req: &CompletionRequest,
-    model: &str,
-    stream: bool,
-) -> Result<Value, (u16, Value)> {
-    let mut body = json!({
-        "model": model,
-    });
-    if stream {
-        body["stream"] = json!(true);
-    }
-
-    let mut input_items: Vec<Value> = Vec::new();
-    let mut instructions: Vec<String> = Vec::new();
-    if let Some(messages) = &req.messages {
-        for msg in messages {
-            let content = msg.content.trim();
-            if content.is_empty() {
-                continue;
-            }
-            let role = msg.role.trim().to_ascii_lowercase();
-            if role == "system" {
-                instructions.push(content.to_string());
-                continue;
-            }
-            let role_value = if role.is_empty() {
-                "user".to_string()
-            } else {
-                role
-            };
-            input_items.push(json!({
-                "role": role_value,
-                "content": content,
-            }));
-        }
-    }
-
-    if !input_items.is_empty() {
-        body["input"] = json!(input_items);
-    } else {
-        let prompt = request_prompt_text(req);
-        if prompt.trim().is_empty() {
-            return Err((400, json!({"error": "prompt or messages required"})));
-        }
-        body["input"] = json!(prompt);
-    }
-
-    if !instructions.is_empty() {
-        body["instructions"] = json!(instructions.join("\n\n"));
-    }
-    if let Some(max_tokens) = req.max_tokens {
-        body["max_output_tokens"] = json!(max_tokens);
-    }
-    if let Some(temperature) = req.temperature {
-        body["temperature"] = json!(temperature);
-    }
-    if let Some(top_p) = req.top_p {
-        body["top_p"] = json!(top_p);
-    }
-    if let Some(stop) = &req.stop {
-        if !stop.is_empty() {
-            body["stop"] = json!(stop);
-        }
-    }
-
-    Ok(body)
 }
 
 fn request_prompt_text(req: &CompletionRequest) -> String {
@@ -5159,22 +5652,30 @@ mod tests {
     }
 
     #[test]
-    fn build_openai_responses_body_uses_input_and_max_output_tokens() {
+    fn build_openai_compat_raw_body_uses_prompt_and_options() {
         let req: CompletionRequest = serde_json::from_value(json!({
             "messages": [
                 {"role": "system", "content": "Be concise."},
                 {"role": "user", "content": "Count to 3."}
             ],
-            "max_tokens": 42
+            "max_tokens": 42,
+            "temperature": 0.3,
+            "top_p": 0.8,
+            "stop": ["done"]
         }))
         .expect("valid completion request");
-        let body = build_openai_responses_body(&req, "gpt-5.2-codex", true).expect("body");
-        assert_eq!(body["model"], "gpt-5.2-codex");
+        let body = build_openai_compat_raw_body("local-model", &req, true).expect("body");
+        assert_eq!(body["model"], "local-model");
         assert_eq!(body["stream"], true);
-        assert_eq!(body["max_output_tokens"], 42);
-        assert_eq!(body["instructions"], "Be concise.");
-        assert_eq!(body["input"][0]["role"], "user");
-        assert_eq!(body["input"][0]["content"], "Count to 3.");
+        assert_eq!(body["prompt"], "Be concise.\n\nCount to 3.");
+        assert_eq!(body["max_tokens"], 42);
+        let temperature = body["temperature"]
+            .as_f64()
+            .expect("temperature should be numeric");
+        assert!((temperature - 0.3).abs() < 1e-6);
+        let top_p = body["top_p"].as_f64().expect("top_p should be numeric");
+        assert!((top_p - 0.8).abs() < 1e-6);
+        assert_eq!(body["stop"], json!(["done"]));
     }
 
     #[test]
@@ -5196,6 +5697,64 @@ mod tests {
         provider.completions_path = "/chat/completions".to_string();
         assert!(is_openai_responses_provider(&provider, "gpt-5.2-codex"));
         assert!(!is_openai_responses_provider(&provider, "gpt-4o"));
+    }
+
+    #[test]
+    fn resolve_rig_endpoint_for_chat_completions_with_prefixed_path() {
+        let mut provider = OpenAICompatConfig::default();
+        provider.base_url = "https://api.mistral.ai".to_string();
+        provider.completions_path = "/v1/chat/completions".to_string();
+
+        let endpoint =
+            resolve_rig_endpoint(&provider, "test-key", "mistral-small").expect("endpoint");
+        assert_eq!(endpoint.api, RigApi::ChatCompletions);
+        assert_eq!(endpoint.base_url, "https://api.mistral.ai/v1");
+    }
+
+    #[test]
+    fn resolve_rig_endpoint_for_openai_responses() {
+        let mut provider = OpenAICompatConfig::default();
+        provider.base_url = "https://api.openai.com/v1".to_string();
+        provider.completions_path = "/chat/completions".to_string();
+
+        let endpoint =
+            resolve_rig_endpoint(&provider, "test-key", "gpt-5.2-codex").expect("endpoint");
+        assert_eq!(endpoint.api, RigApi::Responses);
+        assert_eq!(endpoint.base_url, "https://api.openai.com/v1");
+    }
+
+    #[test]
+    fn resolve_rig_endpoint_supports_local_without_api_key() {
+        let mut provider = OpenAICompatConfig::default();
+        provider.base_url = "http://127.0.0.1:11434/v1".to_string();
+        provider.completions_path = "/chat/completions".to_string();
+
+        let endpoint = resolve_rig_endpoint(&provider, "", "model").expect("endpoint");
+        assert_eq!(endpoint.api, RigApi::ChatCompletions);
+        assert_eq!(endpoint.base_url, "http://127.0.0.1:11434/v1");
+    }
+
+    #[test]
+    fn resolve_rig_endpoint_maps_non_chat_path_to_raw() {
+        let mut provider = OpenAICompatConfig::default();
+        provider.base_url = "https://api.example.com/v1".to_string();
+        provider.completions_path = "/completions".to_string();
+
+        let endpoint = resolve_rig_endpoint(&provider, "test-key", "model").expect("endpoint");
+        assert_eq!(endpoint.api, RigApi::OpenAICompatRaw);
+        assert_eq!(endpoint.base_url, "https://api.example.com/v1");
+        assert_eq!(endpoint.path.as_deref(), Some("/completions"));
+    }
+
+    #[test]
+    fn resolve_rig_endpoint_maps_anthropic_messages() {
+        let mut provider = OpenAICompatConfig::default();
+        provider.base_url = "https://api.anthropic.com".to_string();
+        provider.completions_path = "/v1/messages".to_string();
+
+        let endpoint = resolve_rig_endpoint(&provider, "test-key", "claude").expect("endpoint");
+        assert_eq!(endpoint.api, RigApi::AnthropicMessages);
+        assert_eq!(endpoint.base_url, "https://api.anthropic.com");
     }
 }
 

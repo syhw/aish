@@ -405,7 +405,7 @@ Inside shell:
 - `ai --attach <id>` -> attach to session
 
 ## Resume Notes (Codex)
-- Project root: `/Users/gab/aish_codex`
+- Project root: `/Users/<user>/aish_codex`
 - Rust workspace: `Cargo.toml` at repo root, crates in `crates/`
 - Binaries: `aish` (launcher) and `aishd` (daemon)
 - Config module: `crates/aish_core/src/config.rs`
