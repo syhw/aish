@@ -36,6 +36,18 @@ Ask the model:
 ai "Summarize this repository in 5 bullets."
 ```
 
+Force workspace context attachment for a general prompt:
+
+```bash
+ai --with-workspace-context "Give me a quick overview of what is in here."
+```
+
+Show context-debug output and disable streaming:
+
+```bash
+ai --context-debug --no-stream "Summarize this repository and tell me what to inspect first."
+```
+
 Pipe prompt from stdin:
 
 ```bash
@@ -257,6 +269,25 @@ Use a specific provider/model:
 ai --provider local-3000 --model gemini-3-pro-preview "Count to 5 slowly"
 ```
 
+Force or disable workspace context:
+
+```bash
+ai --with-workspace-context "What does this codebase do?"
+ai --no-workspace-context "Summarize this repo in 5 bullets."
+```
+
+Print workspace and logs-context debug details:
+
+```bash
+ai --context-debug "Summarize this repo in 5 bullets."
+```
+
+Disable streaming for debugging/provider compatibility:
+
+```bash
+ai --no-stream "Why did this fail?"
+```
+
 How request body is built for `ai "why did this fail?"`:
 
 Without `AISH_SESSION_ID` in environment, `ai` sends:
@@ -297,6 +328,20 @@ curl -fsS "$AISHD_URL/v1/completions" \
   -d "{\"prompt\":\"$Q\",\"session_id\":\"$SID\",\"context_mode\":\"diagnostic\"}" \
   | python3 -m json.tool
 ```
+
+Repo summary from cwd plus diagnostics from logs context:
+
+```bash
+export AISHD_URL="${AISHD_URL:-http://127.0.0.1:5033}"
+export AISH_SESSION_ID="${AISH_SESSION_ID:-<session_id>}"
+
+ai --context-debug "Summarize this repository in 5 bullets and tell me what failed most recently."
+```
+
+Expected behavior:
+- workspace context is auto-attached because the prompt is repo-oriented
+- `--context-debug` prints workspace source names/sizes to stderr
+- if `AISH_SESSION_ID` is set, `ai` also prints a `/v1/logs/context` preview summary
 
 ## Troubleshooting
 

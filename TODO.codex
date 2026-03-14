@@ -1,0 +1,21 @@
+# TODO (Next Work)
+
+## P0 - Context and Retrieval Quality
+- [x] Add a retrieval-debug mode in `ai` to print which context sources were included (cwd, git status, README, logs context id/count).
+- [x] Add a flag to force context attachment: `ai --with-workspace-context "..."` and disable with `--no-workspace-context`.
+- [x] Improve workspace summarization payload: include recent commits (`git log -n 5 --oneline`) and cap token budget deterministically.
+- [x] Add tests that verify repository/folder prompts include workspace context and non-repo prompts do not.
+
+## P0 - Streaming Reliability
+- [x] Add integration test for `/v1/completions/stream` with a mock OpenAI-compatible SSE server.
+- [ ] Add graceful fallback behavior test: streaming endpoint fails -> non-stream `/v1/completions` still returns answer.
+- [x] Add optional `--no-stream` switch in `ai` for debugging and provider compatibility.
+
+## P1 - Log-Aware Context Engineering
+- [ ] Merge workspace context + `/v1/logs/context` bundle into one composed preamble with strict size caps and provenance tags.
+- [ ] Add retrieval ledger fields for workspace context usage (`workspace_context_used`, `workspace_context_chars`).
+- [ ] Expand relevance harness with cases for "summarize this repo", "what changed", and mixed debug + design queries.
+
+## P1 - Docs and UX
+- [x] Document new context-selection switches and streaming controls in `README.md` and `EXAMPLES.md`.
+- [x] Add `EXAMPLES.md` flow: "repo summary from cwd + diagnostics from logs context".

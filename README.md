@@ -349,6 +349,11 @@ Context bundle retrieval:
 
 How context is included in LLM calls:
 - `ai` automatically sends `session_id` and `context_mode: "diagnostic"` when `AISH_SESSION_ID` is set (for example inside `aish launch`).
+- `ai` auto-attaches workspace context for prompts that look repo/folder-oriented (for example `ai "Summarize this repository"`).
+- Use `ai --with-workspace-context "..."` to force workspace context attachment for general prompts.
+- Use `ai --no-workspace-context "..."` to suppress workspace context even for repo-summary prompts.
+- Use `ai --context-debug "..."` to print attached workspace context sources plus a `/v1/logs/context` preview when `AISH_SESSION_ID` is set.
+- Use `ai --no-stream "..."` to skip SSE streaming and force non-streaming `/v1/completions`.
 - For direct API usage, pass `session_id` and `context_mode` to `/v1/completions`.
 - Diagnostic mode is optimized for questions like:
 `"what did I do wrong?"`, `"why did this command fail?"`, `"what changed in this session?"`.

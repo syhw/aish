@@ -2758,7 +2758,7 @@ async fn call_openai_compat_completions_rig_async(
                 .base_url(&endpoint.base_url)
                 .build()
                 .map_err(rig_http_error_to_response)?;
-            let model_client = client.completions_api().completion_model(model);
+            let model_client = client.completions_api().completion_model(&model);
             let builder = apply_rig_request_options(
                 model_client.completion_request(prompt_chat),
                 &req,
@@ -2766,11 +2766,21 @@ async fn call_openai_compat_completions_rig_async(
                 messages_chat,
                 RigApi::ChatCompletions,
             );
-            let response = builder
-                .send()
-                .await
-                .map_err(rig_completion_error_to_response)?;
-            rig_completion_response_to_value(response)
+            match builder.send().await {
+                Ok(response) => rig_completion_response_to_value(response),
+                Err(err) if should_fallback_to_raw_chat(&err) => {
+                    let body = build_openai_compat_chat_body(&model, &req, false)?;
+                    call_openai_compat_raw_with_rig(
+                        &endpoint.base_url,
+                        "/chat/completions",
+                        &rig_openai_api_key,
+                        body,
+                    )
+                    .await
+                    .map(normalize_chat_completion_value)
+                }
+                Err(err) => Err(rig_completion_error_to_response(err)),
+            }
         }
         RigApi::AnthropicMessages => {
             let client: rig_anthropic::Client = rig_anthropic::Client::builder()
@@ -2882,11 +2892,21 @@ where
                 messages_chat,
                 RigApi::ChatCompletions,
             );
-            let stream = builder
-                .stream()
-                .await
-                .map_err(rig_completion_error_to_response)?;
-            consume_rig_stream(stream, &mut on_delta).await?
+            match builder.stream().await {
+                Ok(stream) => consume_rig_stream(stream, &mut on_delta).await?,
+                Err(err) if should_fallback_to_raw_chat(&err) => {
+                    let body = build_openai_compat_chat_body(&model, &req, true)?;
+                    call_openai_compat_raw_streaming_with_rig(
+                        &endpoint.base_url,
+                        "/chat/completions",
+                        &rig_openai_api_key,
+                        body,
+                        &mut on_delta,
+                    )
+                    .await?
+                }
+                Err(err) => return Err(rig_completion_error_to_response(err)),
+            }
         }
         RigApi::AnthropicMessages => {
             let client: rig_anthropic::Client = rig_anthropic::Client::builder()
@@ -3072,6 +3092,65 @@ fn build_openai_compat_raw_body(
     Ok(body)
 }
 
+fn build_openai_compat_chat_body(
+    model: &str,
+    req: &CompletionRequest,
+    stream: bool,
+) -> Result<Value, (u16, Value)> {
+    let messages = if let Some(messages) = &req.messages {
+        let mapped = messages
+            .iter()
+            .filter_map(|msg| {
+                let content = msg.content.trim();
+                if content.is_empty() {
+                    None
+                } else {
+                    Some(json!({
+                        "role": msg.role,
+                        "content": content,
+                    }))
+                }
+            })
+            .collect::<Vec<_>>();
+        if mapped.is_empty() {
+            return Err((400, json!({"error": "prompt or messages required"})));
+        }
+        mapped
+    } else {
+        let prompt = req.prompt.as_deref().unwrap_or("").trim();
+        if prompt.is_empty() {
+            return Err((400, json!({"error": "prompt or messages required"})));
+        }
+        vec![json!({
+            "role": "user",
+            "content": prompt,
+        })]
+    };
+
+    let mut body = json!({
+        "model": model,
+        "messages": messages,
+    });
+    if stream {
+        body["stream"] = json!(true);
+    }
+    if let Some(max_tokens) = req.max_tokens {
+        body["max_tokens"] = json!(max_tokens);
+    }
+    if let Some(temperature) = req.temperature {
+        body["temperature"] = json!(temperature);
+    }
+    if let Some(top_p) = req.top_p {
+        body["top_p"] = json!(top_p);
+    }
+    if let Some(stop) = &req.stop {
+        if !stop.is_empty() {
+            body["stop"] = json!(stop);
+        }
+    }
+    Ok(body)
+}
+
 async fn call_openai_compat_raw_with_rig(
     base_url: &str,
     path: &str,
@@ -3199,6 +3278,24 @@ where
         }
     }
     false
+}
+
+fn should_fallback_to_raw_chat(err: &rig_completion::CompletionError) -> bool {
+    err.to_string().contains("JsonError")
+}
+
+fn normalize_chat_completion_value(value: Value) -> Value {
+    if extract_completion_text(&value).is_some() {
+        return value;
+    }
+
+    if let Some(raw) = value.get("raw").cloned() {
+        if extract_completion_text(&raw).is_some() {
+            return raw;
+        }
+    }
+
+    value
 }
 
 fn rig_choice_text(choice: &rig::OneOrMany<RigAssistantContent>) -> String {
@@ -5676,6 +5773,50 @@ mod tests {
         let top_p = body["top_p"].as_f64().expect("top_p should be numeric");
         assert!((top_p - 0.8).abs() < 1e-6);
         assert_eq!(body["stop"], json!(["done"]));
+    }
+
+    #[test]
+    fn build_openai_compat_chat_body_preserves_messages_and_options() {
+        let req: CompletionRequest = serde_json::from_value(json!({
+            "messages": [
+                {"role": "system", "content": " Be concise. "},
+                {"role": "user", "content": "Count to 3."}
+            ],
+            "max_tokens": 42,
+            "temperature": 0.3,
+            "top_p": 0.8,
+            "stop": ["done"]
+        }))
+        .expect("valid completion request");
+        let body = build_openai_compat_chat_body("chat-model", &req, true).expect("body");
+        assert_eq!(body["model"], "chat-model");
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["messages"][0], json!({"role": "system", "content": "Be concise."}));
+        assert_eq!(body["messages"][1], json!({"role": "user", "content": "Count to 3."}));
+        assert_eq!(body["max_tokens"], 42);
+        let temperature = body["temperature"]
+            .as_f64()
+            .expect("temperature should be numeric");
+        assert!((temperature - 0.3).abs() < 1e-6);
+        let top_p = body["top_p"].as_f64().expect("top_p should be numeric");
+        assert!((top_p - 0.8).abs() < 1e-6);
+        assert_eq!(body["stop"], json!(["done"]));
+    }
+
+    #[test]
+    fn normalize_chat_completion_value_prefers_raw_chat_payload() {
+        let value = json!({
+            "raw": {
+                "choices": [{
+                    "message": {"role": "assistant", "content": "CHAT_OK"}
+                }]
+            }
+        });
+        let normalized = normalize_chat_completion_value(value);
+        assert_eq!(
+            normalized["choices"][0]["message"]["content"],
+            json!("CHAT_OK")
+        );
     }
 
     #[test]

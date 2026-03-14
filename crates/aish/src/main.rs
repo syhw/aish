@@ -40,6 +40,18 @@ enum CliCommand {
     Llm {
         /// Prompt text (if omitted, read from stdin)
         prompt: Vec<String>,
+        /// Force attaching workspace context even for general prompts
+        #[arg(long, default_value_t = false, conflicts_with = "no_workspace_context")]
+        with_workspace_context: bool,
+        /// Disable automatic workspace context attachment
+        #[arg(long, default_value_t = false, conflicts_with = "with_workspace_context")]
+        no_workspace_context: bool,
+        /// Print attached workspace/log context details to stderr
+        #[arg(long, default_value_t = false)]
+        context_debug: bool,
+        /// Disable SSE streaming and use non-streaming completions only
+        #[arg(long, default_value_t = false)]
+        no_stream: bool,
         /// Provider profile name (e.g. together)
         #[arg(long)]
         provider: Option<String>,
@@ -114,6 +126,10 @@ fn main() -> Result<()> {
             if !std::io::stdin().is_terminal() {
                 CliCommand::Llm {
                     prompt: Vec::new(),
+                    with_workspace_context: false,
+                    no_workspace_context: false,
+                    context_debug: false,
+                    no_stream: false,
                     provider: None,
                     model: None,
                     max_tokens: None,
@@ -153,6 +169,10 @@ fn main() -> Result<()> {
         }
         CliCommand::Llm {
             prompt,
+            with_workspace_context,
+            no_workspace_context,
+            context_debug,
+            no_stream,
             provider,
             model,
             max_tokens,
@@ -163,6 +183,9 @@ fn main() -> Result<()> {
             run_llm(
                 &cfg,
                 prompt,
+                workspace_context_mode(with_workspace_context, no_workspace_context),
+                context_debug,
+                no_stream,
                 provider,
                 model,
                 max_tokens,
@@ -678,6 +701,9 @@ fn shell_quote(path: &Path) -> String {
 fn run_llm(
     cfg: &Config,
     prompt_parts: Vec<String>,
+    workspace_mode: WorkspaceContextMode,
+    context_debug: bool,
+    no_stream: bool,
     provider: Option<String>,
     model: Option<String>,
     max_tokens: Option<u32>,
@@ -693,7 +719,8 @@ fn run_llm(
     if prompt.trim().is_empty() {
         bail!("prompt is empty");
     }
-    let prompt = maybe_attach_workspace_context(&prompt);
+    let prompt_text = prompt.clone();
+    let workspace = maybe_attach_workspace_context(&prompt, workspace_mode);
     let opts = CompletionOverrides {
         provider,
         model,
@@ -701,17 +728,21 @@ fn run_llm(
         temperature,
         top_p,
         stop,
+        no_stream,
     };
     let session_id = env::var("AISH_SESSION_ID")
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
+    if context_debug {
+        print_context_debug(cfg, &workspace.report, session_id.as_deref(), &prompt_text);
+    }
 
     let _ = write_log_event_value(
         cfg,
         "llm.request".to_string(),
         json!({
-            "prompt": prompt,
+            "prompt": workspace.prompt,
             "model": opts.model.clone().map(Value::String).unwrap_or(Value::Null),
             "provider": opts.provider.clone().map(Value::String).unwrap_or(Value::Null),
             "agentic_inline": true,
@@ -721,7 +752,7 @@ fn run_llm(
         None,
     );
 
-    match run_llm_inline_agentic(cfg, &prompt, &opts, session_id.as_deref()) {
+    match run_llm_inline_agentic(cfg, &workspace.prompt, &opts, session_id.as_deref()) {
         Ok(out) => {
             if !out.is_empty() && !out.ends_with('\n') {
                 println!();
@@ -741,7 +772,7 @@ fn run_llm(
         }
     }
 
-    let out = run_llm_single_completion(cfg, &prompt, &opts, session_id.as_deref())?;
+    let out = run_llm_single_completion(cfg, &workspace.prompt, &opts, session_id.as_deref())?;
     if !out.is_empty() && !out.ends_with('\n') {
         println!();
     }
@@ -767,6 +798,49 @@ struct CompletionOverrides {
     temperature: Option<f32>,
     top_p: Option<f32>,
     stop: Vec<String>,
+    no_stream: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WorkspaceContextMode {
+    Auto,
+    Force,
+    Disabled,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WorkspaceContextSource {
+    name: &'static str,
+    chars: usize,
+}
+
+#[derive(Clone, Debug, Default)]
+struct WorkspaceContextBundle {
+    text: String,
+    sources: Vec<WorkspaceContextSource>,
+}
+
+#[derive(Clone, Debug)]
+struct WorkspaceContextAttachment {
+    prompt: String,
+    report: WorkspaceContextReport,
+}
+
+#[derive(Clone, Debug)]
+struct WorkspaceContextReport {
+    mode: WorkspaceContextMode,
+    attached: bool,
+    source_count: usize,
+    total_chars: usize,
+    sources: Vec<WorkspaceContextSource>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LogsContextPreview {
+    session_id: String,
+    intent: String,
+    selected_evidence: Vec<Value>,
+    context_text: String,
 }
 
 #[derive(Debug, Clone)]
@@ -922,10 +996,12 @@ fn run_llm_single_completion(
         body["stop"] = json!(opts.stop);
     }
 
-    let mut stream_body = body.clone();
-    stream_body["stream"] = json!(true);
-    if let Ok(out) = stream_completion_response(&stream_url, &stream_body) {
-        return Ok(out);
+    if !opts.no_stream {
+        let mut stream_body = body.clone();
+        stream_body["stream"] = json!(true);
+        if let Ok(out) = stream_completion_response(&stream_url, &stream_body) {
+            return Ok(out);
+        }
     }
 
     let agent = ureq::AgentBuilder::new()
@@ -1393,15 +1469,67 @@ fn command_exists(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn maybe_attach_workspace_context(prompt: &str) -> String {
-    if !should_attach_workspace_context(prompt) {
-        return prompt.to_string();
+fn workspace_context_mode(with_workspace_context: bool, no_workspace_context: bool) -> WorkspaceContextMode {
+    if with_workspace_context {
+        WorkspaceContextMode::Force
+    } else if no_workspace_context {
+        WorkspaceContextMode::Disabled
+    } else {
+        WorkspaceContextMode::Auto
+    }
+}
+
+fn maybe_attach_workspace_context(
+    prompt: &str,
+    mode: WorkspaceContextMode,
+) -> WorkspaceContextAttachment {
+    if !should_attach_workspace_context_for_mode(prompt, mode) {
+        return WorkspaceContextAttachment {
+            prompt: prompt.to_string(),
+            report: WorkspaceContextReport {
+                mode,
+                attached: false,
+                source_count: 0,
+                total_chars: 0,
+                sources: Vec::new(),
+            },
+        };
     }
     match collect_workspace_context() {
-        Some(ctx) => format!(
-            "You are answering a question about the user's local workspace.\nUse the provided workspace context as source material.\nIf information is missing, say so briefly.\n\nWorkspace context:\n{ctx}\n\nUser request:\n{prompt}"
-        ),
-        None => prompt.to_string(),
+        Some(ctx) => {
+            let total_chars = ctx.text.chars().count();
+            WorkspaceContextAttachment {
+                prompt: format!(
+                    "You are answering a question about the user's local workspace.\nUse the provided workspace context as source material.\nIf information is missing, say so briefly.\n\nWorkspace context:\n{}\n\nUser request:\n{prompt}",
+                    ctx.text
+                ),
+                report: WorkspaceContextReport {
+                    mode,
+                    attached: true,
+                    source_count: ctx.sources.len(),
+                    total_chars,
+                    sources: ctx.sources,
+                },
+            }
+        }
+        None => WorkspaceContextAttachment {
+            prompt: prompt.to_string(),
+            report: WorkspaceContextReport {
+                mode,
+                attached: false,
+                source_count: 0,
+                total_chars: 0,
+                sources: Vec::new(),
+            },
+        },
+    }
+}
+
+fn should_attach_workspace_context_for_mode(prompt: &str, mode: WorkspaceContextMode) -> bool {
+    match mode {
+        WorkspaceContextMode::Force => true,
+        WorkspaceContextMode::Disabled => false,
+        WorkspaceContextMode::Auto => should_attach_workspace_context(prompt),
     }
 }
 
@@ -1423,51 +1551,196 @@ fn should_attach_workspace_context(prompt: &str) -> bool {
     .any(|needle| p.contains(needle))
 }
 
-fn collect_workspace_context() -> Option<String> {
+fn collect_workspace_context() -> Option<WorkspaceContextBundle> {
+    const WORKSPACE_CONTEXT_MAX_CHARS: usize = 8_000;
+    const GIT_STATUS_MAX_CHARS: usize = 1_200;
+    const RECENT_COMMITS_MAX_CHARS: usize = 600;
+    const TRACKED_FILES_MAX_CHARS: usize = 1_200;
+    const TOP_LEVEL_ENTRIES_MAX_CHARS: usize = 800;
+    const README_MAX_CHARS: usize = 2_500;
+
     let cwd = env::current_dir().ok()?;
-    let mut lines = Vec::new();
-    lines.push(format!("- cwd: {}", cwd.display()));
+    let mut sections = Vec::new();
+    sections.push(("cwd", format!("- cwd: {}", cwd.display())));
 
     let repo_root = run_command_capture(Some(&cwd), "git", &["rev-parse", "--show-toplevel"])
         .map(PathBuf::from);
     if let Some(root) = &repo_root {
-        lines.push(format!("- repo_root: {}", root.display()));
+        sections.push(("repo_root", format!("- repo_root: {}", root.display())));
         if let Some(branch) =
             run_command_capture(Some(root), "git", &["rev-parse", "--abbrev-ref", "HEAD"])
         {
-            lines.push(format!("- git_branch: {}", branch));
+            sections.push(("git_branch", format!("- git_branch: {}", branch)));
         }
         if let Some(status) = run_command_capture(Some(root), "git", &["status", "--short"]) {
-            let status = truncate_chars(&status, 2_000);
+            let status = truncate_chars(&status, GIT_STATUS_MAX_CHARS);
             if !status.trim().is_empty() {
-                lines.push("- git_status_short:".to_string());
-                lines.push(indented_block(&status));
+                sections.push((
+                    "git_status_short",
+                    format!("- git_status_short:\n{}", indented_block(&status)),
+                ));
+            }
+        }
+        if let Some(commits) = run_command_capture(Some(root), "git", &["log", "-n", "5", "--oneline"])
+        {
+            let commits = truncate_chars(&commits, RECENT_COMMITS_MAX_CHARS);
+            if !commits.trim().is_empty() {
+                sections.push((
+                    "recent_commits",
+                    format!("- recent_commits:\n{}", indented_block(&commits)),
+                ));
             }
         }
         if let Some(files) = run_command_capture(Some(root), "git", &["ls-files"]) {
             let mut listed = Vec::new();
-            for line in files.lines().take(200) {
+            for line in files.lines().take(80) {
                 listed.push(line.to_string());
             }
             if !listed.is_empty() {
-                lines.push("- tracked_files_sample:".to_string());
-                lines.push(indented_block(&listed.join("\n")));
+                let sample = truncate_chars(&listed.join("\n"), TRACKED_FILES_MAX_CHARS);
+                sections.push((
+                    "tracked_files_sample",
+                    format!("- tracked_files_sample:\n{}", indented_block(&sample)),
+                ));
             }
         }
     }
 
     let list_target = repo_root.as_ref().unwrap_or(&cwd);
     if let Some(entries) = list_dir_entries(list_target, 120) {
-        lines.push("- top_level_entries:".to_string());
-        lines.push(indented_block(&entries.join("\n")));
+        let entries = truncate_chars(&entries.join("\n"), TOP_LEVEL_ENTRIES_MAX_CHARS);
+        sections.push((
+            "top_level_entries",
+            format!("- top_level_entries:\n{}", indented_block(&entries)),
+        ));
     }
 
-    if let Some(readme) = read_readme_excerpt(list_target, 4_000) {
-        lines.push("- readme_excerpt:".to_string());
-        lines.push(indented_block(&readme));
+    if let Some(readme) = read_readme_excerpt(list_target, README_MAX_CHARS) {
+        sections.push((
+            "readme_excerpt",
+            format!("- readme_excerpt:\n{}", indented_block(&readme)),
+        ));
     }
 
-    Some(lines.join("\n"))
+    let mut parts = Vec::new();
+    let mut sources = Vec::new();
+    let mut used = 0usize;
+    for (name, section) in sections {
+        if used >= WORKSPACE_CONTEXT_MAX_CHARS {
+            break;
+        }
+        let remaining = WORKSPACE_CONTEXT_MAX_CHARS.saturating_sub(used);
+        let chunk = truncate_chars(&section, remaining);
+        if chunk.trim().is_empty() {
+            continue;
+        }
+        used += chunk.chars().count();
+        parts.push(chunk.clone());
+        sources.push(WorkspaceContextSource {
+            name,
+            chars: chunk.chars().count(),
+        });
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(WorkspaceContextBundle {
+            text: parts.join("\n"),
+            sources,
+        })
+    }
+}
+
+fn print_context_debug(
+    cfg: &Config,
+    workspace: &WorkspaceContextReport,
+    session_id: Option<&str>,
+    prompt: &str,
+) {
+    eprintln!("context debug:");
+    eprintln!(
+        "  workspace_context: attached={} mode={} sources={} chars={}",
+        workspace.attached,
+        workspace_context_mode_label(workspace.mode),
+        workspace.source_count,
+        workspace.total_chars
+    );
+    for source in &workspace.sources {
+        eprintln!("  workspace_source: {} ({})", source.name, source.chars);
+    }
+
+    match session_id {
+        Some(session_id) => match fetch_logs_context_preview(cfg, session_id, prompt) {
+            Ok(Some(preview)) => {
+                eprintln!(
+                    "  logs_context: session={} intent={} selected={} chars={}",
+                    preview.session_id,
+                    preview.intent,
+                    preview.selected_evidence.len(),
+                    preview.context_text.chars().count()
+                );
+            }
+            Ok(None) => {
+                eprintln!("  logs_context: session={} unavailable", session_id);
+            }
+            Err(err) => {
+                eprintln!("  logs_context: session={} error={}", session_id, err);
+            }
+        },
+        None => eprintln!("  logs_context: disabled (no AISH_SESSION_ID)"),
+    }
+}
+
+fn workspace_context_mode_label(mode: WorkspaceContextMode) -> &'static str {
+    match mode {
+        WorkspaceContextMode::Auto => "auto",
+        WorkspaceContextMode::Force => "force",
+        WorkspaceContextMode::Disabled => "disabled",
+    }
+}
+
+fn fetch_logs_context_preview(
+    cfg: &Config,
+    session_id: &str,
+    prompt: &str,
+) -> Result<Option<LogsContextPreview>> {
+    let base_url = format!("http://{}:{}", cfg.server.hostname, cfg.server.port);
+    let url = format!(
+        "{}/v1/logs/context/{}?q={}&max_chars=1600",
+        base_url,
+        session_id,
+        percent_encode_query_param(prompt)
+    );
+    let agent = ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(20))
+        .build();
+    let resp = match agent.get(&url).call() {
+        Ok(resp) => resp,
+        Err(ureq::Error::Status(_, resp)) => {
+            let text = resp.into_string().unwrap_or_default();
+            return Err(anyhow!("request failed: {text}"));
+        }
+        Err(err) => return Err(anyhow!("request failed: {err}")),
+    };
+    let text = resp.into_string().unwrap_or_default();
+    let preview: LogsContextPreview = serde_json::from_str(&text)
+        .with_context(|| "failed to parse logs context preview")?;
+    Ok(Some(preview))
+}
+
+fn percent_encode_query_param(value: &str) -> String {
+    let mut out = String::new();
+    for byte in value.bytes() {
+        let ch = byte as char;
+        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '~') {
+            out.push(ch);
+        } else if ch == ' ' {
+            out.push_str("%20");
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
 }
 
 fn run_command_capture(cwd: Option<&Path>, program: &str, args: &[&str]) -> Option<String> {
@@ -1864,7 +2137,9 @@ fn read_last_event(path: &Path) -> Option<Value> {
 mod tests {
     use super::{
         handle_sse_event, inline_agent_system_prompt, normalize_cli_args, parse_inline_tool_calls,
-        parse_simple_cd, should_attach_workspace_context, ProgressLine,
+        parse_simple_cd, percent_encode_query_param, should_attach_workspace_context,
+        should_attach_workspace_context_for_mode, workspace_context_mode, ProgressLine,
+        WorkspaceContextMode,
     };
     use std::path::Path;
 
@@ -1903,6 +2178,29 @@ mod tests {
                 "--provider",
                 "local-3000",
                 "Count"
+            ]
+        );
+    }
+
+    #[test]
+    fn normalize_cli_args_preserves_llm_flags_before_prompt() {
+        let args = vec![
+            "ai".to_string(),
+            "--with-workspace-context".to_string(),
+            "--context-debug".to_string(),
+            "--no-stream".to_string(),
+            "Summarize".to_string(),
+        ];
+        let out = normalize_cli_args(args);
+        assert_eq!(
+            out,
+            vec![
+                "ai",
+                "llm",
+                "--with-workspace-context",
+                "--context-debug",
+                "--no-stream",
+                "Summarize",
             ]
         );
     }
@@ -1965,6 +2263,42 @@ mod tests {
     #[test]
     fn should_attach_workspace_context_ignores_general_prompts() {
         assert!(!should_attach_workspace_context("Count to 5 slowly."));
+    }
+
+    #[test]
+    fn should_attach_workspace_context_mode_overrides_heuristic() {
+        assert!(should_attach_workspace_context_for_mode(
+            "Count to 5 slowly.",
+            WorkspaceContextMode::Force
+        ));
+        assert!(!should_attach_workspace_context_for_mode(
+            "Summarize this repository.",
+            WorkspaceContextMode::Disabled
+        ));
+    }
+
+    #[test]
+    fn workspace_context_mode_prefers_explicit_flags() {
+        assert_eq!(
+            workspace_context_mode(true, false),
+            WorkspaceContextMode::Force
+        );
+        assert_eq!(
+            workspace_context_mode(false, true),
+            WorkspaceContextMode::Disabled
+        );
+        assert_eq!(
+            workspace_context_mode(false, false),
+            WorkspaceContextMode::Auto
+        );
+    }
+
+    #[test]
+    fn percent_encode_query_param_escapes_reserved_bytes() {
+        assert_eq!(
+            percent_encode_query_param("repo summary? x=y/z"),
+            "repo%20summary%3F%20x%3Dy%2Fz"
+        );
     }
 
     #[test]
